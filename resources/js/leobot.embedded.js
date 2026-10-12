@@ -101,12 +101,12 @@ function load_embedded_leobot(config) {
     <div style="font-size: 14px; margin-bottom: 10px;">
       ${mergedConfig.text.form.title}
     </div>
-    <form id="leo_contact_form">
-      <input required placeholder="${mergedConfig.text.form.name}" style="width:100%; padding:8px; margin-bottom:8px; border:1px solid #ccc; border-radius:6px;" /><br/>
-      <input required placeholder="${mergedConfig.text.form.phone}" style="width:100%; padding:8px; margin-bottom:8px; border:1px solid #ccc; border-radius:6px;" /><br/>
-      <input type="email" placeholder="${mergedConfig.text.form.email}" style="width:100%; padding:8px; margin-bottom:8px; border:1px solid #ccc; border-radius:6px;" /><br/>
-      <textarea required placeholder="${mergedConfig.text.form.question}" rows="3" style="width:100%; padding:8px; margin-bottom:12px; border:1px solid #ccc; border-radius:6px;"></textarea><br/>
-      <button type="submit" style="width:100%; padding:10px; background:#005bea; color:white; border:none; border-radius:6px; font-weight:bold; cursor:pointer;">${mergedConfig.text.form.submit}</button>
+    <form id="leo_contact_form" style="display:flex; flex-direction:column; gap:8px;">
+      <input required placeholder="${mergedConfig.text.form.name}" style="width:100%; padding:8px; border:1px solid #ccc; border-radius:6px;" />
+      <input required placeholder="${mergedConfig.text.form.phone}" style="width:100%; padding:8px; border:1px solid #ccc; border-radius:6px;" />
+      <input type="email" placeholder="${mergedConfig.text.form.email}" style="width:100%; padding:8px; border:1px solid #ccc; border-radius:6px;" />
+      <textarea required placeholder="${mergedConfig.text.form.question}" rows="3" style="width:100%; padding:8px; border:1px solid #ccc; border-radius:6px;"></textarea>
+      <button type="submit" style="align-self:flex-end; min-width:120px; width:auto; padding:10px 16px; background:#005bea; color:white; border:none; border-radius:6px; font-weight:bold; cursor:pointer;">${mergedConfig.text.form.submit}</button>
     </form>
   `;
 

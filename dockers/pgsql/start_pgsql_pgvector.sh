@@ -16,13 +16,11 @@ LEGACY_DATA_VOLUME="pgdata_vector"
 POSTGRES_USER="postgres"
 POSTGRES_PASSWORD="password"
 DEFAULT_DB="postgres"
-TARGET_DB="leo360"
+TARGET_DB="${TARGET_DB:-leo360}"
 KEYCLOAK_DB="keycloak"
 HOST_PORT="${PGSQL_DB_PORT:-5433}"
 
-# --- SQL schema config ---
-SCHEMA_VERSION=251203
-SCHEMA_DESCRIPTION="init database schema leo360 for leo bot in CDP and chatbot for end user"
+# --- Canonical SQL schema ---
 SQL_FILE_PATH="$PROJECT_ROOT/sql_scripts/leo360_schema.sql"
 
 # --- Parse options ---
@@ -181,108 +179,21 @@ wait_for_postgres_target() {
 }
 wait_for_postgres_target
 
-# --- Enable extensions ---
-echo "🔧 Enabling extensions in '${TARGET_DB}'..."
-docker exec -u postgres $CONTAINER_NAME psql -d $TARGET_DB -c "CREATE EXTENSION IF NOT EXISTS vector;" || { echo "❌ Failed to enable 'vector'"; exit 1; }
-docker exec -u postgres $CONTAINER_NAME psql -d $TARGET_DB -c "CREATE EXTENSION IF NOT EXISTS postgis;" || { echo "❌ Failed to enable 'postgis'"; exit 1; }
+# --- Apply the canonical schema ---
+if [[ ! -f "$SQL_FILE_PATH" ]]; then
+  echo "❌ SQL schema file not found: $SQL_FILE_PATH" >&2
+  exit 1
+fi
 
-# --- Ensure touchpoint schema and 768-dimensional embeddings ---
-echo "🔧 Ensuring touchpoint schema..."
-docker exec -u postgres "$CONTAINER_NAME" psql -v ON_ERROR_STOP=1 -d "$TARGET_DB" -c "
-CREATE TABLE IF NOT EXISTS touchpoints (
-    touchpoint_id VARCHAR(64) PRIMARY KEY,
-    user_id VARCHAR(255) NOT NULL,
-    tenant_id VARCHAR(50) NOT NULL DEFAULT 'default',
-    latitude DECIMAL(9, 6) NOT NULL CHECK (latitude BETWEEN -90 AND 90),
-    longitude DECIMAL(9, 6) NOT NULL CHECK (longitude BETWEEN -180 AND 180),
-    geom GEOMETRY(Point, 4326) NOT NULL,
-    name TEXT,
-    description TEXT,
-    type VARCHAR(50),
-    keywords TEXT[],
-    embedding VECTOR(768),
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    last_seen_at TIMESTAMPTZ DEFAULT NOW()
-);
-ALTER TABLE touchpoints ADD COLUMN IF NOT EXISTS name TEXT;
-ALTER TABLE touchpoints ADD COLUMN IF NOT EXISTS description TEXT;
-ALTER TABLE touchpoints ADD COLUMN IF NOT EXISTS type VARCHAR(50);
-ALTER TABLE touchpoints ADD COLUMN IF NOT EXISTS keywords TEXT[];
-ALTER TABLE touchpoints ADD COLUMN IF NOT EXISTS embedding VECTOR(768);
-DROP INDEX IF EXISTS idx_touchpoints_embedding;
-DO \$\$
-DECLARE
-    embedding_type TEXT;
-BEGIN
-    SELECT format_type(a.atttypid, a.atttypmod)
-    INTO embedding_type
-    FROM pg_attribute AS a
-    JOIN pg_class AS c ON c.oid = a.attrelid
-    WHERE c.relname = 'touchpoints'
-      AND a.attname = 'embedding'
-      AND NOT a.attisdropped;
-
-    IF embedding_type = 'vector(384)' THEN
-        ALTER TABLE touchpoints
-        ALTER COLUMN embedding TYPE VECTOR(768)
-        USING NULL;
-    END IF;
-END\$\$;
-CREATE INDEX IF NOT EXISTS idx_touchpoints_geom ON touchpoints USING GIST (geom);
-CREATE INDEX IF NOT EXISTS idx_touchpoints_geog
-    ON touchpoints USING GIST ((geom::geography));
-CREATE INDEX IF NOT EXISTS idx_touchpoints_user ON touchpoints (user_id, tenant_id);
-CREATE INDEX IF NOT EXISTS idx_touchpoints_embedding
-    ON touchpoints USING hnsw (embedding vector_cosine_ops)
-    WHERE embedding IS NOT NULL;
-" || { echo "❌ Failed to prepare touchpoint schema."; exit 1; }
-
-# --- Create schema_migrations table ---
-echo "🔧 Creating schema_migrations table..."
-docker exec -u postgres $CONTAINER_NAME psql -d $TARGET_DB -c "
-CREATE TABLE IF NOT EXISTS schema_migrations (
-    version INTEGER PRIMARY KEY,
-    applied_at TIMESTAMP DEFAULT NOW(),
-    description TEXT
-);
-"
-
-# --- Check current schema version ---
-echo "🔍 Checking current schema version..."
-CURRENT_VERSION=$(docker exec -u postgres $CONTAINER_NAME psql -d $TARGET_DB -t -c "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1;" 2>/dev/null | tr -d '[:space:]' || echo "0")
-if [ -z "$CURRENT_VERSION" ]; then CURRENT_VERSION=0; fi
-echo "ℹ️ Current schema version: $CURRENT_VERSION"
-
-# --- Function to apply migration ---
-apply_migration() {
-  local version=$1
-  local description=$2
-  local sql_file_path=$3
-
-  echo "🚀 Applying migration for version $version: $description"
-
-  if [[ ! -f "$sql_file_path" ]]; then
-    echo "❌ SQL file not found: $sql_file_path"
-    exit 1
-  fi
-
-  docker exec -i -u postgres "$CONTAINER_NAME" psql -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$sql_file_path" || { echo "❌ Failed to apply migration $version"; exit 1; }
-
-  docker exec -u postgres "$CONTAINER_NAME" psql -d "$TARGET_DB" -c \
-    "INSERT INTO schema_migrations (version, description, applied_at) VALUES ($version, '$description', NOW());" || { echo "❌ Failed to record migration $version"; exit 1; }
-
-  echo "✅ Migration $version applied successfully."
-}
-
-# --- Apply initial schema migration if needed ---
-if [ $CURRENT_VERSION -lt $SCHEMA_VERSION ]; then
-  apply_migration $SCHEMA_VERSION "$SCHEMA_DESCRIPTION" "$SQL_FILE_PATH"
+echo "🔧 Applying canonical schema from '$SQL_FILE_PATH'..."
+if ! docker exec -i -u postgres "$CONTAINER_NAME" \
+    psql -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$SQL_FILE_PATH"; then
+  echo "❌ Failed to apply the canonical schema." >&2
+  exit 1
 fi
 
 # --- Verify all tables exist ---
-TABLES=("chat_messages" "chat_message_embeddings" "places" "touchpoints" "schema_migrations" "system_users" "conversational_context" "knowledge_sources" "knowledge_chunks" "customer_profile" "transactional_context" "customer_metrics" "tenant_metrics_config")
+TABLES=("chat_messages" "chat_message_embeddings" "geo_places" "touchpoints" "weather_data" "system_users" "conversational_context" "knowledge_sources" "knowledge_chunks" "customer_profile" "transactional_context" "customer_metrics" "tenant_metrics_config")
 for table in "${TABLES[@]}"; do
   docker exec -u postgres $CONTAINER_NAME psql -d $TARGET_DB -tc "SELECT 1 FROM pg_tables WHERE tablename = '$table'" | grep -q 1 || { echo "❌ Table '$table' missing"; exit 1; }
 done
@@ -302,5 +213,4 @@ echo "✅ PostgreSQL ${SERVER_VERSION} + PostGIS + pgvector is ready."
 echo "   ➜ DB: $TARGET_DB"
 echo "   ➜ Tables: ${TABLES[*]}"
 echo "   ➜ Extensions: vector, postgis"
-echo "   ➜ Schema Version: $SCHEMA_VERSION"
 echo "   ➜ Port: $HOST_PORT"

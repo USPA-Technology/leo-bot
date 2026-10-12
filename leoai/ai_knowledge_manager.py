@@ -25,7 +25,8 @@ import json
 import logging
 
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, Union
-from uuid import UUID, uuid4
+from uuid import UUID
+from uuid6 import uuid7
 from datetime import datetime, timezone
 
 
@@ -121,15 +122,17 @@ class KnowledgeManager:
             logger.exception("Error creating knowledge source: %s", exc)
             raise
 
-    async def get_source(self, source_id: Union[UUID, str]) -> Optional[KnowledgeSource]:
+    async def get_source(
+        self, source_id: Union[UUID, str], *, tenant_id: str
+    ) -> Optional[KnowledgeSource]:
         sql = """
         SELECT id, user_id, tenant_id, source_type, name, code_name, uri, status, metadata, created_at, updated_at
         FROM knowledge_sources
-        WHERE id = $1;
+        WHERE id = $1 AND tenant_id = $2;
         """
         try:
             async with get_async_pg_conn() as conn:
-                row = await conn.fetchrow(sql, str(source_id))
+                row = await conn.fetchrow(sql, str(source_id), tenant_id)
                 if not row:
                     return None
                 src = KnowledgeSource(
@@ -201,30 +204,41 @@ class KnowledgeManager:
             logger.exception("Error listing knowledge sources: %s", exc)
             raise
 
-    async def update_source_status(self, source_id: Union[UUID, str], status: ProcessingStatus) -> bool:
+    async def update_source_status(
+        self, source_id: Union[UUID, str], status: ProcessingStatus, *,
+        tenant_id: str,
+    ) -> bool:
         sql = """
         UPDATE knowledge_sources
         SET status = $1, updated_at = NOW()
-        WHERE id = $2
+        WHERE id = $2 AND tenant_id = $3
         RETURNING id;
         """
         try:
             async with get_async_pg_conn() as conn:
-                row = await conn.fetchrow(sql, status.value, str(source_id))
+                row = await conn.fetchrow(
+                    sql, status.value, str(source_id), tenant_id
+                )
                 return bool(row)
         except Exception as exc:
             logger.exception(
                 "Error updating status for source %s: %s", source_id, exc)
             raise
 
-    async def delete_source(self, source_id: Union[UUID, str]) -> bool:
+    async def delete_source(
+        self, source_id: Union[UUID, str], *, tenant_id: str
+    ) -> bool:
         """
         Delete a source (cascades to chunks via ON DELETE CASCADE).
         """
-        sql = "DELETE FROM knowledge_sources WHERE id = $1 RETURNING id;"
+        sql = """
+        DELETE FROM knowledge_sources
+        WHERE id = $1 AND tenant_id = $2
+        RETURNING id;
+        """
         try:
             async with get_async_pg_conn() as conn:
-                row = await conn.fetchrow(sql, str(source_id))
+                row = await conn.fetchrow(sql, str(source_id), tenant_id)
                 return bool(row)
         except Exception as exc:
             logger.exception("Error deleting source %s: %s", source_id, exc)
@@ -254,8 +268,8 @@ class KnowledgeManager:
         total_inserted = 0
         insert_sql = """
         INSERT INTO knowledge_chunks
-            (id, source_id, content, embedding, chunk_sequence, metadata, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            (id, tenant_id, source_id, content, embedding, chunk_sequence, metadata, created_at)
+        VALUES ($1, $2, $3, $4, $5::vector, $6, $7, NOW())
         ON CONFLICT (id) DO NOTHING;
         """
         try:
@@ -269,6 +283,7 @@ class KnowledgeManager:
                             await conn.execute(
                                 insert_sql,
                                 str(c.id),
+                                c.tenant_id,
                                 str(c.source_id),
                                 c.content,
                                 # asyncpg should map Python list to vector if pgvector is configured.
@@ -286,25 +301,30 @@ class KnowledgeManager:
 
     async def get_chunks_by_source(self,
                                    source_id: Union[UUID, str],
+                                   *,
+                                   tenant_id: str,
                                    limit: int = 100,
                                    offset: int = 0,
                                    order_by_sequence: bool = True
                                    ) -> List["KnowledgeChunk"]:
         order = "chunk_sequence ASC" if order_by_sequence else "created_at DESC"
         sql = f"""
-        SELECT id, source_id, content, embedding, chunk_sequence, metadata, created_at
+        SELECT id, tenant_id, source_id, content, embedding, chunk_sequence, metadata, created_at
         FROM knowledge_chunks
-        WHERE source_id = $1
+        WHERE tenant_id = $1 AND source_id = $2
         ORDER BY {order}
-        LIMIT $2 OFFSET $3;
+        LIMIT $3 OFFSET $4;
         """
         try:
             async with get_async_pg_conn() as conn:
-                rows = await conn.fetch(sql, str(source_id), limit, offset)
+                rows = await conn.fetch(
+                    sql, tenant_id, str(source_id), limit, offset
+                )
                 result = []
                 for r in rows:
                     chunk = KnowledgeChunk(
                         id=str(r["id"]),
+                        tenant_id=r["tenant_id"],
                         source_id=str(r["source_id"]),
                         content=r["content"],
                         embedding=parse_embedding(
@@ -324,7 +344,8 @@ class KnowledgeManager:
         self,
         query_embedding: List[float],
         top_k: int = 10,
-        tenant_id: Optional[str] = None,
+        *,
+        tenant_id: str,
         user_id: Optional[str] = None,
         min_score: Optional[float] = None
     ) -> List[Tuple[KnowledgeChunk, float]]:
@@ -340,26 +361,22 @@ class KnowledgeManager:
 
         # Build base query
         base_sql = """
-        SELECT kc.id, kc.source_id, kc.content, kc.embedding, kc.chunk_sequence, kc.metadata, kc.created_at,
+        SELECT kc.id, kc.tenant_id, kc.source_id, kc.content, kc.embedding, kc.chunk_sequence, kc.metadata, kc.created_at,
             (kc.embedding <-> $1) AS distance
         FROM knowledge_chunks kc
+        JOIN knowledge_sources ks
+          ON ks.tenant_id = kc.tenant_id AND ks.id = kc.source_id
         """
-        params: List[Any] = [query_vec]
-
-        # Join with sources if tenant/user filters exist
-        if tenant_id or user_id:
-            base_sql += " JOIN knowledge_sources ks ON ks.id = kc.source_id\n"
-
-        where_clauses: List[str] = []
-        if tenant_id:
-            params.append(tenant_id)
-            where_clauses.append(f"ks.tenant_id = ${len(params)}")
+        params: List[Any] = [query_vec, tenant_id]
+        where_clauses: List[str] = [
+            f"kc.tenant_id = ${len(params)}",
+            f"ks.tenant_id = ${len(params)}",
+        ]
         if user_id:
             params.append(user_id)
             where_clauses.append(f"ks.user_id = ${len(params)}")
 
-        if where_clauses:
-            base_sql += " WHERE " + " AND ".join(where_clauses)
+        base_sql += " WHERE " + " AND ".join(where_clauses)
 
         base_sql += f" ORDER BY distance ASC LIMIT ${len(params) + 1};"
         params.append(top_k)
@@ -375,6 +392,7 @@ class KnowledgeManager:
                         continue
                     chunk = KnowledgeChunk(
                         id=str(r["id"]),
+                        tenant_id=r["tenant_id"],
                         source_id=str(r["source_id"]),
                         content=r["content"],
                         embedding=parse_embedding(
@@ -390,22 +408,33 @@ class KnowledgeManager:
             logger.exception("Error in vector search: %s", exc)
             raise
 
-    async def count_chunks_for_source(self, source_id: Union[UUID, str]) -> int:
-        sql = "SELECT COUNT(*) FROM knowledge_chunks WHERE source_id = $1;"
+    async def count_chunks_for_source(
+        self, source_id: Union[UUID, str], *, tenant_id: str
+    ) -> int:
+        sql = """
+        SELECT COUNT(*) FROM knowledge_chunks
+        WHERE tenant_id = $1 AND source_id = $2;
+        """
         try:
             async with get_async_pg_conn() as conn:
-                row = await conn.fetchval(sql, str(source_id))
+                row = await conn.fetchval(sql, tenant_id, str(source_id))
                 return int(row or 0)
         except Exception as exc:
             logger.exception(
                 "Error counting chunks for source %s: %s", source_id, exc)
             raise
 
-    async def remove_chunks_for_source(self, source_id: Union[UUID, str]) -> int:
-        sql = "DELETE FROM knowledge_chunks WHERE source_id = $1 RETURNING id;"
+    async def remove_chunks_for_source(
+        self, source_id: Union[UUID, str], *, tenant_id: str
+    ) -> int:
+        sql = """
+        DELETE FROM knowledge_chunks
+        WHERE tenant_id = $1 AND source_id = $2
+        RETURNING id;
+        """
         try:
             async with get_async_pg_conn() as conn:
-                rows = await conn.fetch(sql, str(source_id))
+                rows = await conn.fetch(sql, tenant_id, str(source_id))
                 return len(rows)
         except Exception as exc:
             logger.exception(
@@ -465,7 +494,8 @@ class KnowledgeManager:
         chunk_models: List[KnowledgeChunk] = []
         for idx, (chunk_text, emb) in enumerate(zip(chunks_text, all_embeddings)):
             chunk_models.append(KnowledgeChunk(
-                id=uuid4(),
+                id=uuid7(),
+                tenant_id=created_source.tenant_id,
                 source_id=created_source.id,
                 content=chunk_text,
                 embedding=emb,
@@ -478,22 +508,35 @@ class KnowledgeManager:
 
         # mark source active if inserted successfully
         if inserted > 0:
-            await self.update_source_status(created_source.id, ProcessingStatus.ACTIVE)
+            await self.update_source_status(
+                created_source.id, ProcessingStatus.ACTIVE,
+                tenant_id=created_source.tenant_id,
+            )
         else:
-            await self.update_source_status(created_source.id, ProcessingStatus.FAILED)
+            await self.update_source_status(
+                created_source.id, ProcessingStatus.FAILED,
+                tenant_id=created_source.tenant_id,
+            )
 
         return created_source, inserted
 
     # ---------------------------
     # Convenience / Admin
     # ---------------------------
-    async def archive_source(self, source_id: Union[UUID, str]) -> bool:
-        return await self.update_source_status(source_id, ProcessingStatus.ARCHIVED)
+    async def archive_source(
+        self, source_id: Union[UUID, str], *, tenant_id: str
+    ) -> bool:
+        return await self.update_source_status(
+            source_id, ProcessingStatus.ARCHIVED, tenant_id=tenant_id
+        )
 
-    async def mark_source_failed(self, source_id: Union[UUID, str], reason: Optional[str] = None) -> bool:
+    async def mark_source_failed(
+        self, source_id: Union[UUID, str], *, tenant_id: str,
+        reason: Optional[str] = None,
+    ) -> bool:
         # optionally store reason in metadata
         try:
-            src = await self.get_source(source_id)
+            src = await self.get_source(source_id, tenant_id=tenant_id)
             if not src:
                 return False
             metadata = src.metadata or {}
@@ -504,11 +547,17 @@ class KnowledgeManager:
             sql = """
             UPDATE knowledge_sources
             SET status = $1, metadata = $2, updated_at = NOW()
-            WHERE id = $3
+            WHERE id = $3 AND tenant_id = $4
             RETURNING id;
             """
             async with get_async_pg_conn() as conn:
-                row = await conn.fetchrow(sql, ProcessingStatus.FAILED.value, json.dumps(metadata), str(source_id))
+                row = await conn.fetchrow(
+                    sql,
+                    ProcessingStatus.FAILED.value,
+                    json.dumps(metadata),
+                    str(source_id),
+                    tenant_id,
+                )
                 return bool(row)
         except Exception as exc:
             logger.exception(

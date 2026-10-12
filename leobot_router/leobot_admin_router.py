@@ -1,10 +1,10 @@
 import os
 import time
-import uuid
 import json
 import logging
 import urllib3
 import httpx
+from uuid6 import uuid7
 from dotenv import load_dotenv
 from fastapi import APIRouter, Query, Request, HTTPException, Header
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
@@ -79,7 +79,7 @@ else:
 # ------------------------------------------------------------------------------
 def create_redis_session(user_info: dict, token: dict) -> str:
     """Store user info + token in Redis, return session ID."""
-    session_id = f"sid:{uuid.uuid4()}"
+    session_id = f"sid:{uuid7()}"
     data = json.dumps(
         {"user": user_info, "token": token, "timestamp": int(time.time())}
     )

@@ -1,27 +1,29 @@
 """
-Airflow DAG: ArangoDB -> Postgres ETL for LEO CDP
+Dagster job: ArangoDB -> Postgres ETL for LEO CDP
 - Extract customer profiles & transactional events
-- Batch embeddings (placeholder)
+- Batch embeddings
 - Upsert into customer_profile and transactional_context
 - Call refresh_customer_metrics per tenant
-Notes:
-- Replace `get_embeddings_batch` with your real provider (OpenAI, Vertex, etc).
-- Store secrets (API keys) in Connections or a secret backend, not in Variables.
 """
 
-from datetime import datetime, timedelta
 import json
 import logging
+import os
 from typing import List, Dict, Any, Iterable, TypedDict, Optional
+from arango.client import ArangoClient
+from arango.cursor import Cursor
 
-from airflow import DAG
-from airflow.decorators import task
-from airflow.models import Variable
-from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.providers.arangodb.hooks.arangodb import ArangoDBHook
-from airflow.models.param import Param
-from airflow.exceptions import AirflowException # Import for raising errors
-
+from dagster import (
+    Config,
+    ConfigurableResource,
+    Definitions,
+    EnvVar,
+    Field,
+    OpExecutionContext,
+    RetryPolicy,
+    job,
+    op,
+)
 
 # external libs
 import psycopg  # psycopg3
@@ -30,30 +32,32 @@ from leoai.ai_core import get_embedding_model
 # ---------------------------
 # CONFIG
 # ---------------------------
-DEFAULT_ARGS = {
-    'owner': 'leo_cdp',
-    'depends_on_past': False,
-    'email_on_failure': False,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
-}
-
-# --- Connections & Variables ---
-ARANGO_CONN_ID = 'leo_cdp_arangodb'
-PG_CONN_ID = 'leo_bot_pgsql'
-
-# 
-EMBED_BATCH_SIZE = int(Variable.get("embed_batch_size", default_var=64))
-ARANGO_PROFILE_COL = Variable.get("arango_profile_collection", default_var="cdp_profile")
-ARANGO_TXN_COL = Variable.get("arango_txn_collection", default_var="cdp_profile2conversion")
-
-
-# --- Static Config ---
-DATA_SOURCE_TAG = 'arango_ingest' # For updated_by columns
-
-# logging
-log = logging.getLogger("airflow.task")
+DATA_SOURCE_TAG = "arango_ingest"
+RETRY_POLICY = RetryPolicy(max_retries=1, delay=300)
+log = logging.getLogger("leo_cdp.etl")
 logging.basicConfig(level=logging.INFO)
+
+
+class ArangoResource(ConfigurableResource):
+    url: str
+    database: str = "leo_cdp"
+    username: str
+    password: str
+    profile_collection: str = "cdp_profile"
+    transaction_collection: str = "cdp_profile2conversion"
+
+    def get_database(self):
+        client = ArangoClient(hosts=self.url)
+        return client.db(self.database, username=self.username, password=self.password)
+
+
+class PostgresResource(ConfigurableResource):
+    dsn: str
+
+
+class EmbeddingConfig(Config):
+    batch_size: int = 64
+
 
 def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
@@ -88,46 +92,9 @@ def chunked_iterable(iterable: Iterable, size: int):
         yield chunk
 
     
-def get_leo_cdp_database(arango_conn_id: str = "leo_cdp_arangodb"):
-    """
-    Returns an ArangoDBHook and the connected database handle.
+def get_leo_cdp_database(arango: ArangoResource):
+    return arango.get_database()
 
-    The function ensures:
-    - Safe access to the ArangoDB client.
-    - Proper fallback to a default database name.
-    - Compatible with Airflow 2.11 provider APIs.
-    """
-    # Initialize the hook using the Airflow connection ID
-    hook = ArangoDBHook(arangodb_conn_id=arango_conn_id)
-
-    # Get the low-level python-arango client
-    client = hook.get_conn()  # ensures connection is initialized
-
-    # Determine database name (try connection.extra or fallback)
-    db_name = getattr(hook, "database", None) or "leo_cdp_test"
-
-    # Get credentials from the hook (depends on provider’s API)
-    username = getattr(hook, "username", None)
-    password = getattr(hook, "password", None)
-
-    # Get a database object using the client
-    db = client.db(db_name, username=username, password=password)
-
-    return db
-
-def get_pg_dsn():
-    """
-    Use PostgresHook to derive DSN (URI) that psycopg can consume.
-    """
-    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
-    # PostgresHook.get_uri() exists and returns a connection URI (postgresql://...)
-    try:
-        uri = hook.get_uri()
-    except Exception:
-        # fallback: build from connection
-        conn = hook.get_connection(PG_CONN_ID)
-        uri = conn.get_uri()
-    return uri
 
 # ---------------------------
 # Define TypedDicts for data contracts
@@ -164,24 +131,21 @@ class TransactionRecord(TypedDict):
 
 
 # ---------------------------
-# DAG
+# Dagster job composition
 # ---------------------------
-with DAG(
-    dag_id='leo_cdp_to_leo_bot_etl',
-    default_args=DEFAULT_ARGS,
-    #schedule_interval='@hourly',
-    schedule=None,
-    start_date=datetime(2025, 1, 1),
-    max_active_runs=10,
-    catchup=False,
-    tags=['leo_cdp', 'etl'],
-    params={
-        "segment_id": Param("", type="string", description="Segment ID to filter profiles")
-    }
-) as dag:
+@job(name="leo_cdp_to_leo_bot_etl")
+def leo_cdp_to_leo_bot_etl():
 
-    @task()
-    def extract_profiles(segment_id: str = "", batch_size: int = 5000) -> List[Dict[str, Any]]:
+    @op(
+        retry_policy=RETRY_POLICY,
+        config_schema={
+            "segment_id": Field(str, default_value="", description="LEO CDP segment ID"),
+            "batch_size": Field(int, default_value=5000),
+        },
+    )
+    def extract_profiles(
+        context: OpExecutionContext, leo_arango: ArangoResource
+    ) -> List[Dict[str, Any]]:
         """
         Efficiently extracts profiles using key-based pagination and streaming cursor.
         This avoids the performance penalty of OFFSET-based pagination in ArangoDB.
@@ -190,11 +154,13 @@ with DAG(
         - Uses `stream=True` to avoid loading all results at once.
         - Automatically stops when fewer than `batch_size` profiles are fetched.
         """
+        segment_id = context.op_config["segment_id"]
+        batch_size = context.op_config["batch_size"]
         if not segment_id:
             log.warning("No segment_id provided, returning empty list.")
             return []
 
-        db = get_leo_cdp_database()
+        db = get_leo_cdp_database(leo_arango)
 
         # AQL query using key-based pagination (faster than LIMIT + OFFSET)
         aql_template = """
@@ -214,7 +180,7 @@ with DAG(
 
         while True:
             bind_vars = {
-                "@col": ARANGO_PROFILE_COL,
+                "@col": leo_arango.profile_collection,
                 "segment_id": segment_id,
                 "last_key": last_key,
                 "limit": batch_size
@@ -225,9 +191,10 @@ with DAG(
                 bind_vars=bind_vars,
                 batch_size=batch_size,
                 stream=True,   # stream results for lower memory footprint
-                ttl=600
             )
 
+            if not isinstance(cursor, Cursor):
+                raise RuntimeError("ArangoDB did not return a query cursor")
             batch_profiles = list(cursor)
             fetched = len(batch_profiles)
             if fetched == 0:
@@ -250,8 +217,10 @@ with DAG(
         log.info("Extraction completed. Total profiles fetched: %d", total_fetched)
         return all_profiles
 
-    @task()
-    def extract_transactions(profile_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    @op(retry_policy=RETRY_POLICY)
+    def extract_transactions(
+        profile_docs: List[Dict[str, Any]], leo_arango: ArangoResource
+    ) -> List[Dict[str, Any]]:
         if not profile_docs:
             log.warning("No profiles provided, returning empty transaction list")
             return []
@@ -261,7 +230,7 @@ with DAG(
             log.warning("No valid profile keys found")
             return []
 
-        db = get_leo_cdp_database()
+        db = get_leo_cdp_database(leo_arango)
 
         aql = """
         FOR e IN @@col
@@ -269,18 +238,25 @@ with DAG(
             RETURN e
         """
         bind_vars = {
-            "@col": ARANGO_TXN_COL,
+            "@col": leo_arango.transaction_collection,
             "profile_ids": [f"cdp_profile/{k}" for k in profile_keys]
         }
 
         cursor = db.aql.execute(aql, bind_vars=bind_vars)
+        if not isinstance(cursor, Cursor):
+            raise RuntimeError("ArangoDB did not return a transaction cursor")
         txns = list(cursor)
         log.info("Extracted %d transactions related to %d profiles", len(txns), len(profile_keys))
         return txns
 
 
-    @task()
-    def transform_and_embed_profiles(profiles: List[Dict[str, Any]]) -> List[ProfileRecord]:
+    @op(
+        retry_policy=RETRY_POLICY,
+        config_schema={"batch_size": Field(int, default_value=64)},
+    )
+    def transform_and_embed_profiles(
+        context: OpExecutionContext, profiles: List[Dict[str, Any]]
+    ) -> List[ProfileRecord]:
         """
         Transforms a list of LEO CDP profiles into a format ready for PostgreSQL
         insertion into the `customer_profile` table, including generating embeddings.
@@ -328,7 +304,9 @@ with DAG(
         # 4. Generate Embeddings in Batches
         embeddings = []
         if texts:
-            for idx_chunk in chunked_iterable(range(len(texts)), EMBED_BATCH_SIZE):
+            for idx_chunk in chunked_iterable(
+                range(len(texts)), context.op_config["batch_size"]
+            ):
                 batch_texts = [texts[i] for i in idx_chunk]
                 vecs = get_embeddings_batch(
                     batch_texts
@@ -360,8 +338,13 @@ with DAG(
             })
         return results
 
-    @task()
-    def transform_and_embed_txns(txns: List[Dict[str, Any]]) -> List[TransactionRecord]: 
+    @op(
+        retry_policy=RETRY_POLICY,
+        config_schema={"batch_size": Field(int, default_value=64)},
+    )
+    def transform_and_embed_txns(
+        context: OpExecutionContext, txns: List[Dict[str, Any]]
+    ) -> List[TransactionRecord]:
         """
         Transforms a list of ArangoDB transaction events into a format ready for PostgreSQL
         insertion into the `transactional_context` table, including generating embeddings.
@@ -399,8 +382,9 @@ with DAG(
                 text_parts.append(f"Asset Groups: {', '.join(t['assetGroupIds'])}")
             if t.get('segmentIds'):
                 text_parts.append(f"Segments: {', '.join(t['segmentIds'])}")
-            if t.get('totalEvent') is not None and t.get('totalEvent') > 0:
-                text_parts.append(f"Total Events: {t['totalEvent']}")
+            total_events = t.get('totalEvent')
+            if isinstance(total_events, (int, float)) and total_events > 0:
+                text_parts.append(f"Total Events: {total_events}")
                 
             text = " ".join(filter(None, text_parts))
             
@@ -411,7 +395,9 @@ with DAG(
         # 4. Generate Embeddings in Batches
         embeddings = []
         if texts:
-            for idx_chunk in chunked_iterable(range(len(texts)), EMBED_BATCH_SIZE):
+            for idx_chunk in chunked_iterable(
+                range(len(texts)), context.op_config["batch_size"]
+            ):
                 batch_texts = [texts[i] for i in idx_chunk]
                 vecs = get_embeddings_batch(
                     batch_texts
@@ -445,8 +431,10 @@ with DAG(
             })
         return results
 
-    @task()
-    def load_profiles_to_pg(profile_records: List[ProfileRecord]) -> int:
+    @op(retry_policy=RETRY_POLICY)
+    def load_profiles_to_pg(
+        profile_records: List[ProfileRecord], leo_pg: PostgresResource
+    ) -> int:
         """
         Loads prepared customer profile records into the PostgreSQL customer_profile table 
         using psycopg's executemany for bulk UPSERT.
@@ -455,7 +443,7 @@ with DAG(
             log.info("No profiles to load")
             return 0
         
-        dsn = get_pg_dsn()
+        dsn = leo_pg.dsn
         upsert_count = 0
         
         # 1. Update SQL to include all customer_profile columns
@@ -463,9 +451,8 @@ with DAG(
             INSERT INTO customer_profile
             (cdp_profile_id, tenant_id, full_name, email, phone, country, age, gender, metadata, profile_embedding, created_at, updated_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::vector, now(), now())
-            ON CONFLICT (cdp_profile_id) DO UPDATE
+            ON CONFLICT (tenant_id, cdp_profile_id) DO UPDATE
             SET
-            tenant_id = EXCLUDED.tenant_id,
             full_name = EXCLUDED.full_name,
             email = EXCLUDED.email,
             phone = EXCLUDED.phone,
@@ -517,17 +504,19 @@ with DAG(
         except psycopg.Error as e:
             log.error(f"PostgreSQL Error during profile load: {e}")
             # Raise an exception to fail the task
-            raise AirflowException(f"Failed to load profiles to Postgres: {e}")
+            raise RuntimeError(f"Failed to load profiles to Postgres: {e}") from e
         except Exception as e:
             log.error(f"An unexpected error occurred during profile load: {e}")
-            raise AirflowException(f"Unexpected error in load_profiles_to_pg: {e}")
+            raise RuntimeError(f"Unexpected error in load_profiles_to_pg: {e}") from e
 
 
         log.info("Upserted %d profiles to Postgres", upsert_count)
         return upsert_count
 
-    @task()
-    def load_txns_to_pg(txn_records: List[TransactionRecord]) -> int: 
+    @op(retry_policy=RETRY_POLICY)
+    def load_txns_to_pg(
+        txn_records: List[TransactionRecord], leo_pg: PostgresResource
+    ) -> int:
         """
         Loads prepared transaction records into the PostgreSQL transactional_context table 
         using psycopg's executemany for bulk UPSERT.
@@ -537,7 +526,7 @@ with DAG(
             return 0
         
         # 1. Prepare DSN and SQL
-        dsn = get_pg_dsn()
+        dsn = leo_pg.dsn
         upsert_count = 0
         
         upsert_sql = """
@@ -605,16 +594,16 @@ with DAG(
         except psycopg.Error as e:
             log.error(f"PostgreSQL Error during transaction load: {e}")
             # Raise an exception to fail the task
-            raise AirflowException(f"Failed to load transactions to Postgres: {e}")
+            raise RuntimeError(f"Failed to load transactions to Postgres: {e}") from e
         except Exception as e:
             log.error(f"An unexpected error occurred during transaction load: {e}")
-            raise AirflowException(f"Unexpected error in load_txns_to_pg: {e}")
+            raise RuntimeError(f"Unexpected error in load_txns_to_pg: {e}") from e
 
 
         log.info("Upserted %d transactions to Postgres", upsert_count)
         return upsert_count
 
-    @task()
+    @op(retry_policy=RETRY_POLICY)
     # FIX 3: Update signature to match input type from upstream task
     def collect_tenants_from_profiles(profiles: List[ProfileRecord]):
         if not profiles:
@@ -623,12 +612,23 @@ with DAG(
         log.info("Found %d unique tenants to refresh", len(tenants))
         return tenants
 
-    @task()
-    def refresh_metrics_task(tenants: List[str]):
+    @op(retry_policy=RETRY_POLICY)
+    def refresh_metrics_task(
+        context: OpExecutionContext,
+        tenants: List[str],
+        _profile_upsert_count: int,
+        _transaction_upsert_count: int,
+        leo_pg: PostgresResource,
+    ):
+        context.log.info(
+            "Load dependencies completed: %d profiles, %d transactions",
+            _profile_upsert_count,
+            _transaction_upsert_count,
+        )
         if not tenants:
             log.info("No tenants to refresh")
             return 0
-        dsn = get_pg_dsn()
+        dsn = leo_pg.dsn
         try:
             with psycopg.connect(dsn) as conn:
                 with conn.cursor() as cur:
@@ -638,15 +638,15 @@ with DAG(
                 conn.commit()
         except psycopg.Error as e:
             log.error(f"Failed to refresh metrics for tenants: {tenants}. Error: {e}")
-            raise AirflowException(f"Failed to refresh metrics: {e}")
+            raise RuntimeError(f"Failed to refresh metrics: {e}") from e
             
         return len(tenants)
 
     # ---------------------------
-    # DAG execution graph
+    # Job execution graph
     # ---------------------------   
     
-    extracted_profiles = extract_profiles("{{ params.segment_id }}")
+    extracted_profiles = extract_profiles()
     extracted_txns = extract_transactions(extracted_profiles)
     
     transformed_profiles = transform_and_embed_profiles(extracted_profiles)
@@ -657,5 +657,24 @@ with DAG(
     
     tenants_list = collect_tenants_from_profiles(transformed_profiles)
     
-    refresh = refresh_metrics_task(tenants_list)
-    refresh.set_upstream([upsert_profiles, upsert_txns])
+    refresh_metrics_task(tenants_list, upsert_profiles, upsert_txns)
+
+
+defs = Definitions(
+    jobs=[leo_cdp_to_leo_bot_etl],
+    resources={
+        "leo_arango": ArangoResource(
+            url=EnvVar("ARANGO_URL"),
+            database=os.getenv("ARANGO_DATABASE", "leo_cdp"),
+            username=EnvVar("ARANGO_USERNAME"),
+            password=EnvVar("ARANGO_PASSWORD"),
+            profile_collection=os.getenv(
+                "ARANGO_PROFILE_COLLECTION", "cdp_profile"
+            ),
+            transaction_collection=os.getenv(
+                "ARANGO_TRANSACTION_COLLECTION", "cdp_profile2conversion"
+            ),
+        ),
+        "leo_pg": PostgresResource(dsn=EnvVar("PGSQL_DB_URL")),
+    },
+)

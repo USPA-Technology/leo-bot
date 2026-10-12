@@ -3,5 +3,11 @@ name = "leo-bot"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore:The `__fields__` attribute is deprecated:DeprecationWarning:dagster_shared\\.dagster_model\\.pydantic_compat_layer",
+    "ignore:The `update_forward_refs` method is deprecated:DeprecationWarning:fastapi_keycloak\\.model",
+]
+
 [tool.setuptools]
 packages = ["leocdp"]

@@ -10,7 +10,12 @@ from leoai.rag_db_manager import ChatDBManager
 
 logger = logging.getLogger("ContextManager")
 DELTA_TO_REFRESH_CONTEXT = timedelta(seconds=10)
-PLACE_STATE_KEYS = ("selected_place", "place_choices")
+PLACE_STATE_KEYS = (
+    "selected_place",
+    "place_choices",
+    "selected_place_knowledge",
+)
+LOCATION_CONTEXT_KEYS = (*PLACE_STATE_KEYS, "nearby_places", "latitude", "longitude")
 
 SUMMARY_PROMPT_TEMPLATE = """
 You are a data extractor. Please analyze the conversation below. Extract key information and return a single, valid JSON object
@@ -53,27 +58,38 @@ class ContextManager:
         self.client = gemini_client
         self.db = db_manager
 
-    async def build_context_summary(self, user_id, touchpoint_id, cdp_profile_id, user_message):
+    async def build_context_summary(
+        self, user_id, touchpoint_id, cdp_profile_id, user_message, *,
+        include_location: bool = True, tenant_id: str = "default",
+    ):
         current_context = await asyncio.to_thread(
-            self.get_context_summary, user_id, touchpoint_id
+            self.get_context_summary, user_id, touchpoint_id, tenant_id
         )
         previous_user_context = dict((current_context or {}).get("user_context") or {})
+        if not include_location:
+            for key in LOCATION_CONTEXT_KEYS:
+                previous_user_context.pop(key, None)
         place_state = {
             key: deepcopy(previous_user_context[key])
             for key in PLACE_STATE_KEYS if key in previous_user_context
         }
-        touchpoint_context = await self.db.get_touchpoint_context(touchpoint_id)
+        touchpoint_context = (
+            await self.db.get_touchpoint_context(
+                touchpoint_id, user_id=user_id, tenant_id=tenant_id
+            )
+            if include_location else None
+        )
         needs_refresh = self._needs_refresh(current_context)
         if needs_refresh:
             text_context = await self._retrieve_semantic_context(
-                user_id, user_message, touchpoint_id
+                user_id, user_message, touchpoint_id, tenant_id=tenant_id
             )
             refreshed = await self._summarize_context(
                 user_id, touchpoint_id, cdp_profile_id, text_context
             )
             if refreshed is not None:
                 refreshed_user_context = dict(refreshed.get("user_context") or {})
-                for key in PLACE_STATE_KEYS:
+                for key in (PLACE_STATE_KEYS if include_location else LOCATION_CONTEXT_KEYS):
                     refreshed_user_context.pop(key, None)
                 previous_user_context.update(refreshed_user_context)
                 current_context = {**(current_context or {}), **refreshed}
@@ -82,11 +98,15 @@ class ContextManager:
         if touchpoint_context:
             previous_user_context.update(touchpoint_context)
         current_context["user_context"] = previous_user_context
-        if needs_refresh or touchpoint_context:
+        if needs_refresh or touchpoint_context or not include_location:
             persisted_context = dict(current_context)
             persisted_context.pop("updated_at", None)
             saved = await self.db.save_context_summary(
-                user_id, touchpoint_id, cdp_profile_id, persisted_context
+                user_id,
+                touchpoint_id,
+                cdp_profile_id,
+                persisted_context,
+                tenant_id=tenant_id,
             )
             if not saved:
                 raise RuntimeError("Failed to persist conversation context.")
@@ -123,7 +143,9 @@ class ContextManager:
             return None
         return summary
 
-    async def _retrieve_semantic_context(self, user_id, user_message, touchpoint_id, limit=50):
+    async def _retrieve_semantic_context(
+        self, user_id, user_message, touchpoint_id, limit=50, *, tenant_id="default"
+    ):
         """Include recent turns and semantic matches from this conversation only."""
         loop = asyncio.get_event_loop()
         vector = await loop.run_in_executor(
@@ -136,31 +158,33 @@ class ContextManager:
         async with get_async_pg_conn() as conn:
             recent = await conn.fetch("""
                 SELECT message_hash, role, message, created_at FROM chat_messages
-                WHERE user_id = $1 AND touchpoint_id = $2
+                WHERE tenant_id = $1 AND user_id = $2 AND touchpoint_id = $3
                 ORDER BY created_at DESC
-                LIMIT $3;
-            """, user_id, touchpoint_id, min(10, limit))
+                LIMIT $4;
+            """, tenant_id, user_id, touchpoint_id, min(10, limit))
             matches = await conn.fetch("""
                 SELECT cm.message_hash, cm.role, cm.message, cm.created_at
                 FROM chat_messages AS cm
                 JOIN chat_message_embeddings AS ce
-                ON cm.message_hash = ce.message_hash
-                WHERE cm.user_id = $1 AND cm.touchpoint_id = $2
-                ORDER BY ce.embedding <#> ($3)::vector ASC
-                LIMIT $4;
-            """, user_id, touchpoint_id, vector_str, limit)
+                  ON cm.tenant_id = ce.tenant_id
+                 AND cm.message_hash = ce.message_hash
+                WHERE cm.tenant_id = $1 AND cm.user_id = $2
+                  AND cm.touchpoint_id = $3
+                ORDER BY ce.embedding <#> ($4)::vector ASC
+                LIMIT $5;
+            """, tenant_id, user_id, touchpoint_id, vector_str, limit)
 
         rows = {row["message_hash"]: row for row in [*matches, *recent]}
         ordered = sorted(rows.values(), key=lambda row: row["created_at"])
         return "\n".join(f"{row['role']}: {row['message']}" for row in ordered)
 
-    def get_context_summary(self, user_id, touchpoint_id):
+    def get_context_summary(self, user_id, touchpoint_id, tenant_id="default"):
         """Load the last saved context from DB."""
         with get_pg_conn() as conn, conn.cursor() as cur:
             cur.execute("""
                 SELECT context_data, updated_at FROM conversational_context
-                WHERE user_id=%s AND touchpoint_id=%s;
-            """, (user_id, touchpoint_id))
+                WHERE tenant_id=%s AND user_id=%s AND touchpoint_id=%s;
+            """, (tenant_id, user_id, touchpoint_id))
             row = cur.fetchone()
             if not row:
                 return None

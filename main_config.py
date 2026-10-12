@@ -3,7 +3,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 import secrets
 from dotenv import load_dotenv
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.security import (
+    HTTPAuthorizationCredentials,
+    HTTPBasic,
+    HTTPBasicCredentials,
+    HTTPBearer,
+)
 from redis import Redis
 from fastapi import Depends, FastAPI, HTTPException
 import logging
@@ -32,6 +37,7 @@ SERVICE_NAME = f"LEO BOT VERSION: {VERSION}"
 LEOBOT_DEV_MODE = os.getenv("LEOBOT_DEV_MODE") == "true"
 CDP_TRACKING = os.getenv("CDP_TRACKING") == "true"
 HOSTNAME = os.getenv("HOSTNAME", "localhost")
+LEO_DATA_ENRICHMENT_KEY = os.getenv("LEO_DATA_ENRICHMENT_KEY")
 
 # --- Rate Limiting ---
 RATE_LIMIT_MAX_MESSAGES = 20  # max messages
@@ -93,3 +99,25 @@ def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
             headers={"WWW-Authenticate": "Basic"},
         )
     return credentials.username
+
+
+data_enrichment_bearer = HTTPBearer(auto_error=False)
+
+
+def require_data_enrichment_key(
+    credentials: HTTPAuthorizationCredentials | None = Depends(data_enrichment_bearer),
+) -> None:
+    """Require the configured bearer token for external knowledge ingestion."""
+    if not LEO_DATA_ENRICHMENT_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Knowledge ingestion token is not configured.",
+        )
+    if credentials is None or not secrets.compare_digest(
+        credentials.credentials, LEO_DATA_ENRICHMENT_KEY
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )

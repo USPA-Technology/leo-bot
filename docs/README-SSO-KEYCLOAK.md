@@ -152,7 +152,7 @@ using `httpx.AsyncClient`, with debug logs for network troubleshooting.
 ### Key Format
 
 ```
-sid:{UUID4}
+sid:{UUIDv7}
 ```
 
 ### TTL
@@ -280,5 +280,4 @@ You’ll be redirected to the Keycloak login page and, upon success, into the **
 * [ ] Add user roles from Keycloak groups
 * [ ] Add audit logging of login/logout events
 * [ ] Optionally encrypt Redis session data
-
 

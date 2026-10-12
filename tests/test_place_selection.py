@@ -1,3 +1,6 @@
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 from leoai.rag_agent import (
     format_place_picker,
     format_place_selection_confirmation,
@@ -50,8 +53,13 @@ def test_selection_confirmation_names_selected_place():
 
 def test_nearby_church_question_uses_keyword_intent():
     question = "What are churches near me?"
-    assert is_nearby_place_question(question)
-    assert nearby_place_terms(question) == ["church", "cathedral", "nhà thờ"]
+    ai_client = SimpleNamespace(generate_json=Mock(return_value={
+        "is_nearby_place_question": True,
+        "terms": ["church", "cathedral", "nhà thờ"],
+        "search_name": "church",
+    }))
+    assert is_nearby_place_question(question, ai_client)
+    assert nearby_place_terms(question, ai_client) == ["church", "cathedral", "nhà thờ"]
 
 
 def test_nearby_place_question_formats_direct_results():

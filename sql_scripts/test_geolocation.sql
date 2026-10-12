@@ -13,8 +13,9 @@ SELECT
     p.tags,
     ROUND(ST_Distance(p.geom::geography, u.point)::numeric, 1)
         AS distance_meters
-FROM places AS p
+FROM geo_places AS p
 CROSS JOIN user_location AS u
-WHERE ST_DWithin(p.geom::geography, u.point, 50000)
+WHERE p.tenant_id IN ('default', 'global')
+  AND ST_DWithin(p.geom::geography, u.point, 50000)
 ORDER BY p.geom::geography <-> u.point
 LIMIT 10;

@@ -1,5 +1,8 @@
+#### Requirements for the Leo Bot project
+
 # Web application
 fastapi
+fastapi-keycloak
 uvicorn[standard]
 httpx
 jinja2
@@ -8,10 +11,10 @@ python-dotenv
 
 # Email and integrations
 aiosmtplib
-fastapi-keycloak
 urllib3
 
 # Hosted AI providers and translation
+langgraph>=1.2.14,<2
 google-genai
 google-api-core
 google-cloud-translate
@@ -22,20 +25,27 @@ fastembed
 boto3>=1.43.0,<2
 pydantic
 psycopg[binary]
+psycopg2-binary
 asyncpg
 python-arango
+uuid6
 redis
 numpy
-
-# Reporting and resilience
-plotly
-tenacity
-structlog
 
 # GraphQL and Dagster
 dagster-webserver>=1.13.25,<2
 dagster-graphql>=1.13.25,<2
 dagster>=1.13.25,<2
+
+# Geolocation and web scraping
+openlocationcode
+requests
+beautifulsoup4
+
+# Reporting, resilience
+plotly
+tenacity
+structlog
 
 # Testing
 pytest>=7.4,<9

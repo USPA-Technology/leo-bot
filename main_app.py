@@ -15,6 +15,7 @@ from leobot_router.leobot_assets_router import router as assets_router
 from leobot_router.leobot_email_router import router as email_router
 from leobot_router.leobot_facebook_router import router as facebook_router
 from leobot_router.leobot_zalo_router import router as zalo_router
+from leobot_router.leobot_knowledge_router import router as knowledge_router
 
 # Admin (optional Keycloak)
 from leobot_router.leobot_admin_router import keycloak_enabled, router as admin_router
@@ -48,6 +49,7 @@ def create_app() -> FastAPI:
         email_router,
         facebook_router,
         zalo_router,
+        knowledge_router,
     ]
     for r in routers:
         app.include_router(r)

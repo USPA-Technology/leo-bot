@@ -2,11 +2,10 @@
 -- This script contains over 200 places, significantly expanding the Catholic churches across Ho Chi Minh City,
 -- and incorporating highly popular malls, dining venues, cinemas, bookstores, convenience stores, and services.
 -- Coordinates are approximate WGS84 points (longitude, latitude).
--- Safe to rerun: place names are unique and are updated on conflict.
+-- Sample IDs are deterministic placeholders, not Google Places IDs.
+-- Safe to rerun: sample IDs are stable and are updated on conflict.
 
-INSERT INTO places (
-    name, address, description, category, tags, pluscode, geom
-)
+WITH sample_places (name, address, description, category, tags, pluscode, geom) AS (
 VALUES
 -- ==========================================
 -- GROUP 1: HISTORICAL SITES, LANDMARKS & MUSEUMS
@@ -1169,7 +1168,23 @@ VALUES
     NULL,
     ST_SetSRID(ST_MakePoint(106.6519, 10.8188), 4326)
 )
-ON CONFLICT (name) DO UPDATE SET
+)
+INSERT INTO geo_places (
+    tenant_id, geo_place_id, name, address, description, category, tags, pluscode, geom
+)
+SELECT
+    'global',
+    'sample:' || md5(name),
+    name,
+    address,
+    description,
+    category,
+    tags,
+    pluscode,
+    geom
+FROM sample_places
+ON CONFLICT (tenant_id, geo_place_id) DO UPDATE SET
+    name = EXCLUDED.name,
     address = EXCLUDED.address,
     description = EXCLUDED.description,
     category = EXCLUDED.category,

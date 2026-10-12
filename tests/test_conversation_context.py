@@ -81,12 +81,12 @@ def make_memory_conversation():
     state = {}
     messages = []
 
-    async def save_context(user, touchpoint, profile, context):
+    async def save_context(user, touchpoint, profile, context, **kwargs):
         state[(user, touchpoint)] = deepcopy(context)
         state[(user, touchpoint)]["updated_at"] = datetime.now(timezone.utc)
         return True
 
-    def load_context(user, touchpoint):
+    def load_context(user, touchpoint, tenant_id="default"):
         return deepcopy(state.get((user, touchpoint)))
 
     async def save_message(user_id, role, message, *args, **kwargs):
@@ -105,7 +105,9 @@ def make_memory_conversation():
     )
     context = ContextManager(None, FakeClient(), db)
     context.get_context_summary = Mock(side_effect=load_context)
-    context._retrieve_semantic_context = AsyncMock(side_effect=lambda *args: "\n".join(messages))
+    context._retrieve_semantic_context = AsyncMock(
+        side_effect=lambda *args, **kwargs: "\n".join(messages)
+    )
     agent = RAGAgent.__new__(RAGAgent)
     agent.db = db
     agent.context = context
@@ -120,7 +122,8 @@ def test_hi_four_delayed_history_keeps_the_exact_displayed_place():
         greeting = await agent.process_chat_message(
             "visitor", "hi", touchpoint_id="tp", answer_in_format="html"
         )
-        assert greeting.count("<li>") == 5
+        assert "<ol>" not in greeting
+        assert greeting.count("\n") == 6
         assert state[("visitor", "tp")]["user_context"]["place_choices"][3]["name"] == "Cha Tam Church"
         # Reordering fresh geo results must not change what the displayed "4" means.
         db.get_touchpoint_context.return_value = {"nearby_places": list(reversed(PLACES))}
@@ -145,6 +148,30 @@ def test_hi_four_delayed_history_keeps_the_exact_displayed_place():
     asyncio.run(scenario())
 
 
+def test_selected_place_knowledge_is_added_to_answer_context():
+    async def scenario():
+        agent, _, _ = make_memory_conversation()
+        agent.knowledge = SimpleNamespace(
+            retrieve_selected_place=AsyncMock(
+                return_value="Source: Place Guide\nVerified place history."
+            )
+        )
+        await agent.process_chat_message("visitor", "hi", touchpoint_id="tp")
+        await agent.process_chat_message("visitor", "4", touchpoint_id="tp")
+        await agent.process_chat_message(
+            "visitor", "history", touchpoint_id="tp"
+        )
+
+        agent.knowledge.retrieve_selected_place.assert_awaited_once_with(
+            PLACES[3], "history", tenant_id="default", limit=3
+        )
+        prompt = agent._safe_generate.call_args.args[0].prompt_text
+        assert "### Selected Place Knowledge" in prompt
+        assert "Verified place history." in prompt
+
+    asyncio.run(scenario())
+
+
 def test_user_can_explicitly_change_selected_place():
     async def scenario():
         agent, state, _ = make_memory_conversation()
@@ -165,10 +192,14 @@ def test_failed_selection_save_is_not_confirmed():
         original_save = db.save_context_summary.side_effect
         saves = 0
 
-        async def fail_selection(*args):
+        async def fail_selection(*args, **kwargs):
             nonlocal saves
             saves += 1
-            return await original_save(*args) if saves == 1 else False
+            return (
+                await original_save(*args, **kwargs)
+                if saves == 1
+                else False
+            )
 
         db.save_context_summary.side_effect = fail_selection
         answer = await agent.process_chat_message("visitor", "4", touchpoint_id="tp")
@@ -243,8 +274,10 @@ def test_recent_and_semantic_history_are_touchpoint_scoped_and_chronological(mon
             "user: 4", "bot: Selected Cha Tam Church", "user: history",
         ]
         for call in conn.fetch.call_args_list:
-            assert call.args[1:3] == ("visitor", "tp")
-            assert "touchpoint_id = $2" in call.args[0]
+            assert call.args[1:4] == ("default", "visitor", "tp")
+            assert "tenant_id = $1" in call.args[0]
+            assert "user_id = $2" in call.args[0]
+            assert "touchpoint_id = $3" in call.args[0]
 
     asyncio.run(scenario())
 

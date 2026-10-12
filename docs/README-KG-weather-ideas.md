@@ -4,7 +4,7 @@
 
 Kiểu graph này thường gặp trong các hệ thống đề xuất du lịch, routing an toàn, cảnh báo rủi ro khí hậu, và xếp hạng điểm đến theo mức độ ảnh hưởng thời tiết.
 
-Dưới đây là **thiết kế Knowledge Graph** hoàn chỉnh dựa trên schema bạn đã có (places + weather_data), thêm các entity liên quan, các loại quan hệ, ontology nhẹ, mapping qua ArangoDB hoặc PostgreSQL graph extension, và chiến lược cho semantic search + geospatial + rủi ro khí tượng.
+Dưới đây là **thiết kế Knowledge Graph** hoàn chỉnh dựa trên schema bạn đã có (geo_places + weather_data), thêm các entity liên quan, các loại quan hệ, ontology nhẹ, mapping qua ArangoDB hoặc PostgreSQL graph extension, và chiến lược cho semantic search + geospatial + rủi ro khí tượng.
 
 ---
 
@@ -25,7 +25,8 @@ KG phải trả lời được những câu như:
 
 #### **1. Place**
 
-Từ bảng `places`.
+Từ bảng `geo_places`.
+Khóa chính `id` là UUIDv7 được PostgreSQL 18 sinh tự động.
 Thuộc tính quan trọng:
 
 * id, name, address, geom (Point), region_id
@@ -35,6 +36,7 @@ Thuộc tính quan trọng:
 #### **2. WeatherSnapshot**
 
 Từ bảng `weather_data`. Một bản ghi thời tiết tại thời điểm T.
+Khóa chính `id` là UUIDv7 được PostgreSQL 18 sinh tự động.
 
 Thuộc tính:
 
@@ -816,4 +818,3 @@ Lưu ý: pgvector has specific ops; chọn `ivfflat`/`hnsw` according to version
 * Tối ưu `groups` mining cho contrastive (nearby-in-time positive mining).
 * Baked demo: train a small model on synthetic data I generate to show end-to-end.
 * Tinh chỉnh weights cho risk scoring bằng historical event labels (learn weights via logistic regression on labeled impacts).
-

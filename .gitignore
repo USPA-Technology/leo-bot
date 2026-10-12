@@ -178,6 +178,22 @@ leoai/ml-1m.zip.1
 leoai/ml-1m.zip.2
 
 Core/__pycache__/
+.pytest_cache
+**/__pycache__/
+**/*.pyc
 
+# Windy data files
 data_windy/
 data_windy/**
+
+# Dagster files and directories
+.dagster
+.dagster/**
+.dagster-logs/**
+.dagster-pids
+.dagster-pids/**
+.tmp_dagster_**
+
+# Graphify output files
+graphify-out/
+graphify-out/**

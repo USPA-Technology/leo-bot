@@ -1,11 +1,12 @@
 
-from pydantic import BaseModel, Field, HttpUrl, constr
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, constr
 from enum import Enum
 import re
 
 from typing import Any, Dict, List, Optional
-from uuid import UUID, uuid4
+from uuid import UUID
 from datetime import datetime, timezone
+from uuid6 import uuid7
 
 # ---------------------------------------------------------------------
 # Enum Models
@@ -48,7 +49,7 @@ class ProcessingStatus(str, Enum):
 # Pydantic Table Models
 # ---------------------------------------------------------------------
 class KnowledgeSource(BaseModel):
-    id: UUID = Field(default_factory=uuid4)
+    id: UUID = Field(default_factory=uuid7)
     user_id: constr(strip_whitespace=True, min_length=1) # type: ignore
     tenant_id: constr(strip_whitespace=True, min_length=1) # type: ignore
     source_type: KnowledgeSourceType = Field(default=KnowledgeSourceType.OTHER)
@@ -62,13 +63,12 @@ class KnowledgeSource(BaseModel):
     updated_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc))
 
-    class Config:
-        from_attributes = True
-        use_enum_values = True
+    model_config = ConfigDict(from_attributes=True, use_enum_values=True)
 
 
 class KnowledgeChunk(BaseModel):
-    id: UUID = Field(default_factory=uuid4)
+    id: UUID = Field(default_factory=uuid7)
+    tenant_id: constr(strip_whitespace=True, min_length=1) # type: ignore
     source_id: UUID
     content: str
     embedding: List[float]
@@ -77,9 +77,8 @@ class KnowledgeChunk(BaseModel):
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc))
 
-    class Config:
-        from_attributes = True
-        
+    model_config = ConfigDict(from_attributes=True)
+
 
 # ---------------------------------------------------------------------
 # Utilities
