@@ -74,16 +74,16 @@ Secure → Test → Deliver**
 - Agentic software khác gì so với một hàm gọi model một lần.
 - Phân biệt application layer, orchestration layer, AI integration, state,
   knowledge và infrastructure trong LEO Bot.
-- Trace `create_app()` từ [main_app.py](../main_app.py) qua các router và
+- Trace `create_app()` từ [main_app.py](../../main_app.py) qua các router và
   `leobot_lifespan`.
-- Đọc cấu hình runtime trong [main_config.py](../main_config.py),
-  [pyproject.toml](../pyproject.toml) và [requirements.txt](../requirements.txt).
+- Đọc cấu hình runtime trong [main_config.py](../../main_config.py),
+  [pyproject.toml](../../pyproject.toml) và [requirements.txt](../../requirements.txt).
 - Xác định boundary giữa website chat, document chat, nearby-place search,
   Facebook Messenger và Zalo OA.
 
 **Lab**
 
-- Chạy health endpoints và đọc API table trong [README.md](../README.md).
+- Chạy health endpoints và đọc API table trong [README.md](../../README.md).
 - Vẽ request/data-flow diagram cho `POST /_leoai/ask`.
 - Chỉ ra nơi request validation, AI generation, PostgreSQL access, Redis access
   và background enrichment xảy ra.
@@ -99,7 +99,7 @@ component giả định ngoài repository.
 - State graph là cách biến một conversation flow thành một hệ thống có trạng
   thái và điều kiện.
 - Đọc `ChatMessageState`, `START`, `END`, nodes và conditional edges trong
-  [leoai/rag_agent.py](../leoai/rag_agent.py).
+  [leoai/rag_agent.py](../../leoai/rag_agent.py).
 - Routing thực tế của LEO Bot:
   `document_chat` hoặc `standard_chat`; từ standard chat tiếp tục tới
   validation, nearby search hoặc conversation workflow.
@@ -124,7 +124,7 @@ side effect và điểm kết thúc rõ ràng.
 **Thời lượng:** 60 phút  
 **Theory**
 
-- Provider-neutral interface trong [leoai/ai_core.py](../leoai/ai_core.py).
+- Provider-neutral interface trong [leoai/ai_core.py](../../leoai/ai_core.py).
 - `AIClient`, `GeminiClient`, `generate_content()` và structured JSON output.
 - Ba provider đã được cấu hình: `google`, `openai` và `openrouter`.
 - Phân biệt chat model, reasoning model, embedding model và touchpoint
@@ -155,10 +155,10 @@ orchestration và retrieval contract.
 - Context của agent gồm current request, conversation messages, summary,
   profile, selected place và location facts.
 - `ContextManager` trong
-  [leoai/rag_context_manager.py](../leoai/rag_context_manager.py): refresh
+  [leoai/rag_context_manager.py](../../leoai/rag_context_manager.py): refresh
   interval, recent turns, semantic matches và summary persistence.
 - `AgentOrchestrator` trong
-  [leoai/rag_prompt_builder.py](../leoai/rag_prompt_builder.py): current
+  [leoai/rag_prompt_builder.py](../../leoai/rag_prompt_builder.py): current
   question priority, selected-place continuity và evidence boundaries.
 - Redis visitor state: name, touchpoint, profile/session data và sorted-set
   rate limiting.
@@ -183,13 +183,13 @@ không phải một chuỗi hội thoại không giới hạn.
 - Knowledge flow: URL → public fetch → HTML/plain-text extraction → tokenized
   chunks → embeddings → PostgreSQL → retrieval → prompt.
 - `POST /_leoai/update-knowledge` trong
-  [leobot_router/leobot_knowledge_router.py](../leobot_router/leobot_knowledge_router.py).
+  [leobot_router/leobot_knowledge_router.py](../../leobot_router/leobot_knowledge_router.py).
 - `KnowledgeCreator`, `PublicWebPageFetcher` và `KnowledgeRetriever` trong
-  [leoai/rag_knowledge_manager.py](../leoai/rag_knowledge_manager.py).
+  [leoai/rag_knowledge_manager.py](../../leoai/rag_knowledge_manager.py).
 - Giới hạn source: public HTTP(S), validated redirects, content type, 2 MB
   download và 100,000 ký tự extracted text.
 - `knowledge_sources` và `knowledge_chunks` trong
-  [sql_scripts/leo360_schema.sql](../sql_scripts/leo360_schema.sql), với
+  [sql_scripts/leo360_schema.sql](../../sql_scripts/leo360_schema.sql), với
   pgvector, metadata, full-text index và tenant-scoped foreign key.
 - Vì sao ingestion phải giữ knowledge cũ khi fetch, embedding hoặc database
   update thất bại.
@@ -213,7 +213,7 @@ không phải một chuỗi hội thoại không giới hạn.
 
 - Browser geolocation tạo touchpoint; touchpoint được lưu với coordinates,
   geometry, keywords và embedding.
-- `ChatDBManager` trong [leoai/rag_db_manager.py](../leoai/rag_db_manager.py):
+- `ChatDBManager` trong [leoai/rag_db_manager.py](../../leoai/rag_db_manager.py):
   upsert touchpoint, resolve location và `find_nearby_places()`.
 - PostGIS `ST_DWithin`, `ST_Distance`, geography indexes và nearest-first
   ordering.
@@ -242,13 +242,13 @@ discovery/enrichment.
 
 - Background work trong LEO Bot: chat không chờ enrichment hoàn tất.
 - `geo_places_pipeline` trong
-  [dags_pipelines/geo_places_pipeline.py](../dags_pipelines/geo_places_pipeline.py):
+  [dags_pipelines/geo_places_pipeline.py](../../dags_pipelines/geo_places_pipeline.py):
   discovery, coordinate recovery, grounded search, Mass schedule và knowledge
   enrichment.
 - Dagster assets, jobs, resources, config, retry policy và weekly schedule.
 - Commit từng place/source để failure sau đó không rollback dữ liệu đã hợp lệ.
 - `leo_cdp_to_leo_bot_etl` trong
-  [dags_pipelines/arango_to_postgres_leo_cdp.py](../dags_pipelines/arango_to_postgres_leo_cdp.py):
+  [dags_pipelines/arango_to_postgres_leo_cdp.py](../../dags_pipelines/arango_to_postgres_leo_cdp.py):
   keyset pagination, batch embeddings, upsert profiles/transactions và refresh
   metrics.
 - Phân biệt pipeline simulation trong các causal DAG với production data flow.
@@ -256,7 +256,7 @@ discovery/enrichment.
 **Lab**
 
 - Materialize một scoped geo-place run theo cấu hình trong
-  [dags_pipelines/README.md](../dags_pipelines/README.md).
+  [dags_pipelines/README.md](../../dags_pipelines/README.md).
 - Quan sát graph dependencies và retry behavior trong Dagster.
 - Đọc run config của `segment_id`, `batch_size`, `search_name`, coordinates và
   `max_places`.
@@ -274,7 +274,7 @@ retry và persistence rõ ràng.
 - Async request handling, Pydantic request/response models và HTTP error
   semantics.
 - Website endpoints trong
-  [leobot_router/leobot_main_router.py](../leobot_router/leobot_main_router.py):
+  [leobot_router/leobot_main_router.py](../../leobot_router/leobot_main_router.py):
   `/ask`, `/visitor-info`, `/touchpoint/geolocation`, `/ping` và readiness.
 - `resources/`: Jinja2 templates, browser geolocation, visitor profile,
   touchpoint cache và chat transport.
@@ -287,7 +287,7 @@ retry và persistence rõ ràng.
 **Lab**
 
 - Đọc request từ browser đến `/ask` và response rendering trong
-  [resources/js/leocdp.chatbot.js](../resources/js/leocdp.chatbot.js).
+  [resources/js/leocdp.chatbot.js](../../resources/js/leocdp.chatbot.js).
 - Thêm một validation case hoặc response field mà không làm vỡ channel
   adapters.
 - Dùng mock HTTP client để test Facebook/Zalo inbound và outbound flow.
@@ -389,7 +389,7 @@ PostgreSQL/pgvector/PostGIS đang có trong LEO Bot.
   selected place, consent, freshness và uncertainty đều ảnh hưởng đến câu trả
   lời hoặc recommendation.
 - Database persona design trong
-  [sql_scripts/leo360_schema.sql](../sql_scripts/leo360_schema.sql):
+  [sql_scripts/leo360_schema.sql](../../sql_scripts/leo360_schema.sql):
   `persona_schemas` version hóa dimensions; `persona_consents` lưu consent
   append-only; `persona_goals` lưu goal và setpoint theo version;
   `persona_evidence` lưu provenance và missingness; `persona_states` lưu
@@ -404,9 +404,9 @@ PostgreSQL/pgvector/PostGIS đang có trong LEO Bot.
 **Lab / Demo**
 
 1. Trace `persona_id` từ request, message persistence và prompt construction
-   trong [leoai/leo_datamodel.py](../leoai/leo_datamodel.py),
-   [leoai/rag_agent.py](../leoai/rag_agent.py) và
-   [leoai/rag_prompt_builder.py](../leoai/rag_prompt_builder.py).
+   trong [leoai/leo_datamodel.py](../../leoai/leo_datamodel.py),
+   [leoai/rag_agent.py](../../leoai/rag_agent.py) và
+   [leoai/rag_prompt_builder.py](../../leoai/rag_prompt_builder.py).
 2. Thiết kế database persona cho một use case của LEO Bot: xác định schema,
    dimensions, consent scopes, goals, evidence, states và expiring contexts.
 3. Viết SQL/query plan để lấy persona context đúng tenant, đúng user và đúng
@@ -477,17 +477,17 @@ thay vì chỉ trình bày một prompt demo.
 
 | Chủ đề | Source of truth |
 | --- | --- |
-| Application startup và configuration | [main_app.py](../main_app.py), [main_config.py](../main_config.py) |
-| Agent workflow | [leoai/rag_agent.py](../leoai/rag_agent.py) |
-| AI providers và embeddings | [leoai/ai_core.py](../leoai/ai_core.py) |
-| Context và prompt rules | [leoai/rag_context_manager.py](../leoai/rag_context_manager.py), [leoai/rag_prompt_builder.py](../leoai/rag_prompt_builder.py) |
-| Chat, touchpoint và nearby SQL | [leoai/rag_db_manager.py](../leoai/rag_db_manager.py) |
-| Knowledge ingestion và retrieval | [leoai/rag_knowledge_manager.py](../leoai/rag_knowledge_manager.py), [leobot_router/leobot_knowledge_router.py](../leobot_router/leobot_knowledge_router.py) |
-| HTTP and channel adapters | [leobot_router/](../leobot_router/) |
-| Browser UI and transport | [resources/](../resources/) |
-| Schema, vectors, geospatial data, tenancy | [sql_scripts/leo360_schema.sql](../sql_scripts/leo360_schema.sql) |
-| Dagster jobs and assets | [dags_pipelines/](../dags_pipelines/) |
-| Tests and runnable commands | [README.md](../README.md), [tests/](../tests/) |
+| Application startup và configuration | [main_app.py](../../main_app.py), [main_config.py](../../main_config.py) |
+| Agent workflow | [leoai/rag_agent.py](../../leoai/rag_agent.py) |
+| AI providers và embeddings | [leoai/ai_core.py](../../leoai/ai_core.py) |
+| Context và prompt rules | [leoai/rag_context_manager.py](../../leoai/rag_context_manager.py), [leoai/rag_prompt_builder.py](../../leoai/rag_prompt_builder.py) |
+| Chat, touchpoint và nearby SQL | [leoai/rag_db_manager.py](../../leoai/rag_db_manager.py) |
+| Knowledge ingestion và retrieval | [leoai/rag_knowledge_manager.py](../../leoai/rag_knowledge_manager.py), [leobot_router/leobot_knowledge_router.py](../../leobot_router/leobot_knowledge_router.py) |
+| HTTP and channel adapters | [leobot_router/](../../leobot_router/) |
+| Browser UI and transport | [resources/](../../resources/) |
+| Schema, vectors, geospatial data, tenancy | [sql_scripts/leo360_schema.sql](../../sql_scripts/leo360_schema.sql) |
+| Dagster jobs and assets | [dags_pipelines/](../../dags_pipelines/) |
+| Tests and runnable commands | [README.md](../../README.md), [tests/](../../tests/) |
 
 ## Suggested stack trong repository
 
