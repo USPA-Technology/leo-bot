@@ -98,11 +98,22 @@ component giả định ngoài repository.
 
 - State graph là cách biến một conversation flow thành một hệ thống có trạng
   thái và điều kiện.
+- `IntentDetector` trong
+  [leoai/ai_intent_detection.py](../../leoai/ai_intent_detection.py) phân loại
+  mục tiêu trước graph qua `AIClient` và schema JSON. Kết quả đầy đủ gồm
+  `primary_intent`, `purpose`, secondary intents, confidence, entities và
+  `needs_clarification`; channel chỉ mô tả transport. Confidence dưới 0.55
+  yêu cầu clarification; đây là model estimate, chưa phải probability đã được
+  hiệu chuẩn bằng một bộ dữ liệu đánh giá.
 - Đọc `ChatMessageState`, `START`, `END`, nodes và conditional edges trong
   [leoai/rag_agent.py](../../leoai/rag_agent.py).
 - Routing thực tế của LEO Bot:
-  `document_chat` hoặc `standard_chat`; từ standard chat tiếp tục tới
-  validation, nearby search hoặc conversation workflow.
+  low-confidence intent dừng ở clarification; nếu đủ rõ, result được truyền
+  nguyên vẹn vào RAG graph và route document, location hoặc standard flow.
+- `location_chat` sử dụng place entities đã trích xuất; radius/count parsing
+  là validation/parameter parsing, không phải intent classification lần hai.
+- Cùng một intent result được đưa vào document/standard prompt; `purpose` đến
+  từ classifier, không từ bộ keyword thứ hai.
 - Các node chính: `prepare_touchpoint`, `save_user_message`,
   `build_context`, `place_picker`, `place_selection`, `build_prompt`,
   `generate_answer` và `save_answer`.
@@ -111,7 +122,14 @@ component giả định ngoài repository.
 
 **Lab**
 
-- Chạy một document-chat request và một standard-chat request.
+- Trace request qua `IntentDetector`, xác minh context gửi tới model không
+  chứa visitor/tenant/touchpoint IDs.
+- Xác minh Redis rate limit chạy trước intent model để request throttled không
+  tiêu tốn provider call.
+- Chạy document, location, general và low-confidence requests; xác minh cùng
+  một intent result được dùng cho routing và prompt.
+- Với `location_chat`, đối chiếu `search_terms/search_name` từ entities với
+  PostGIS query; xác minh classifier không được chạy lại để phủ định intent.
 - Thêm hoặc sửa một conditional branch nhỏ, giữ nguyên state contract.
 - Viết test cho route khi thiếu một trong hai tọa độ latitude/longitude và
   khi nearby search không có location.

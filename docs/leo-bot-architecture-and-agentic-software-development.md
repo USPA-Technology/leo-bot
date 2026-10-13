@@ -30,7 +30,12 @@ Source of truth cho khóa học là [course-agenda.md](./agentic-course-lectures
 ```text
 Client/channel
     ↓
-FastAPI router + validation + rate limit
+FastAPI request filter
+    ↓
+IntentDetector (AIClient → validated JSON)
+    ├─ needs clarification → ask, stop before retrieval/actions
+    ↓
+FastAPI parameter validation + rate limit
     ↓
 RAGAgent + LangGraph StateGraph
     ├─ document chat
@@ -121,6 +126,7 @@ Startup và router registration nằm trong
 sequenceDiagram
     participant C as Client
     participant R as FastAPI /ask
+    participant I as IntentDetector
     participant X as Redis
     participant A as RAGAgent
     participant G as LangGraph
@@ -129,27 +135,52 @@ sequenceDiagram
     participant L as AI provider
 
     C->>R: POST /ask
-    R->>R: validate visitor/question/location
-    R->>X: rate limit + cached touchpoint/profile
-    R->>A: process_chat_message_with_metadata()
-    A->>G: ainvoke(ChatMessageState)
-    G->>D: save user message / load context
-    G->>M: refresh or reuse summary
-    M->>D: recent turns + semantic context
-    G->>L: generate prompt response
-    G->>D: persist bot answer
-    G-->>A: response + optional run_id
-    A-->>R: metadata result
+    R->>R: validate visitor/question
+    R->>X: enforce rate limit
+    X-->>R: allow / reject
+    R->>I: detect_async(question, RequestContext)
+    I->>L: AIClient.generate_json(schema)
+    L-->>I: IntentDetectionResult JSON
+    I-->>R: intent + purpose + confidence + entities
+    alt needs clarification
+        R->>A: pass same IntentDetectionResult
+        A-->>R: clarification; no graph/retrieval/actions
+    else clear intent
+        R->>R: validate location parameters
+        R->>X: read cached touchpoint/profile
+        R->>A: process_chat_message_with_metadata(result)
+        A->>G: ainvoke(ChatMessageState + result)
+        G->>D: save user message / load context
+        G->>M: refresh or reuse summary
+        M->>D: recent turns + semantic context
+        G->>L: generate prompt response
+        G->>D: persist bot answer
+        G-->>A: response + optional run_id
+        A-->>R: metadata result
+    end
     R-->>C: JSON answer
 ```
+
+Intent classification uses channel/context/persona, not transport-derived
+intent. Visitor, tenant, and touchpoint IDs are excluded from the classifier
+prompt. The full validated result is carried through `ChatMessageState` into
+`AgentOrchestrator.build_prompt`; specialized location parameters are read from
+the result's entities rather than reclassifying nearby intent. `purpose` is
+returned by `IntentDetector`, replacing the prior heuristic purpose detector.
+Confidence is the model's estimate, not a statistically calibrated probability;
+scores below 0.55 force clarification. Calibrating it requires a labeled
+evaluation set and is not implied by the prompt's score bands.
 
 Entry point chính là `handle_chat` trong
 [leobot_main_router.py](../leobot_router/leobot_main_router.py).
 
 ### 4.2 Document chat
 
-Document chat được nhận diện từ `context="agent"` và
-`persona_id="personal_assistant"`. Route này có các boundary riêng:
+Document chat được phân loại bởi `IntentDetector` từ câu hỏi cùng
+`RequestContext` (trong đó `context="agent"` và
+`persona_id="personal_assistant"` là bằng chứng). Cùng
+`IntentDetectionResult` được truyền vào prompt; visitor IDs không gửi tới
+model phân loại. Route này có các boundary riêng:
 
 ```mermaid
 flowchart TD
@@ -175,7 +206,8 @@ Document excerpts là evidence; history chỉ dùng để resolve reference, kh�
 ```mermaid
 flowchart TD
     Q["Question: coffee near me"]
-    Classify["Classify nearby intent\nextract terms/radius/limit"]
+    Intent["IntentDetector → location_chat\n+ search_terms/search_name"]
+    Params["Parse and validate radius/count"]
     Location{"Coordinates or owned touchpoint?"}
     Search["PostGIS ST_DWithin + nearest ordering"]
     Enough{"Enough places?"}
@@ -183,7 +215,7 @@ flowchart TD
     Queue["Queue bounded Dagster enrichment"]
     Status["Return run_id + status URL"]
 
-    Q --> Classify --> Location
+    Q --> Intent --> Params --> Location
     Location -- no --> AskLocation["Ask visitor for location"]
     Location -- yes --> Search --> Enough
     Enough -- yes --> Partial
@@ -232,7 +264,8 @@ flowchart LR
 
 - **Goal:** trả lời câu hỏi, tìm places hoặc trả lời dựa trên document.
 - **State:** `ChatMessageState`, context summary, touchpoint, selected place.
-- **Decision:** document/standard/nearby route và place selection.
+- **Decision:** `IntentDetector` chọn intent độc lập với channel; graph tiếp tục
+  qua document, location hoặc standard workflow và xử lý place selection.
 - **Action:** PostgreSQL, Redis, provider, knowledge retrieval, Dagster.
 - **Observation:** retrieved chunks, places, persisted state, run status.
 - **Guardrail:** schema, tenant scope, auth, rate limit, timeout và `END`.
@@ -245,7 +278,8 @@ vẫn giữ quyền kiểm soát:
 - nodes và conditional edges được định nghĩa trước;
 - model không tự thực thi arbitrary code;
 - tool-like functions kiểm tra input và authorization;
-- document chat loại location state bằng application logic;
+- `IntentDetector` dùng `AIClient` để xác định `document_chat` từ câu hỏi và
+  request context, sau đó loại location state bằng application logic;
 - nearby enrichment bị giới hạn count và radius;
 - mỗi request có terminal path;
 - background job được tách khỏi response latency.
@@ -275,7 +309,7 @@ retrieval/context:
   terms, matching_places, summarized_context, user_context
 
 decision/output:
-  selected_place, prompt_router, response, enrichment_run_id
+  primary_intent, selected_place, prompt_router, response, enrichment_run_id
 ```
 
 State này là request-scoped state; persistent memory nằm ở database/Redis,
@@ -286,7 +320,8 @@ không phải một global Python object.
 ```mermaid
 flowchart TD
     Start((START))
-    Type{"_route_chat_type"}
+    Detect["IntentDetector"]
+    Type{"primary_intent"}
     Doc["document_chat"]
     Validate["validate_input"]
     Nearby["nearby_places"]
@@ -302,7 +337,7 @@ flowchart TD
     SaveAnswer["save_answer"]
     End((END))
 
-    Start --> Type
+    Start --> Detect --> Type
     Type -- document_chat --> Doc --> End
     Type -- standard_chat --> Validate
     Validate -- nearby --> Nearby
@@ -640,4 +675,3 @@ và mỗi failure có behavior quan sát được.
 **Agentic Software Development** vì vậy không chỉ là học gọi LLM. Đó là học
 cách biến model capability thành một software system có state, workflow,
 grounding, side effect, guardrail, test và khả năng bàn giao.
-

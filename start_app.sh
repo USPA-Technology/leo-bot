@@ -95,6 +95,7 @@ if [[ "$RESET_DB" == true ]]; then
   echo "WARNING: --reset-db will delete the existing PostgreSQL data."
   PGSQL_ARGS+=(--reset-db)
 fi
+# Apply the canonical schema and geo-place search indexes before starting services.
 bash "$SCRIPT_DIR/dockers/pgsql/start_pgsql_pgvector.sh" "${PGSQL_ARGS[@]}"
 
 if [[ "$SEED_DATA" == true ]]; then

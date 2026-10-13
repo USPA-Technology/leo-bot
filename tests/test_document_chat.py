@@ -15,7 +15,8 @@ from fastapi.testclient import TestClient
 
 from leoai import rag_knowledge_manager
 from leoai.db_utils import DATABASE_URL, to_pgvector
-from leoai.rag_agent import DOCUMENT_CHAT_TOUCHPOINT_ID, RAGAgent, is_document_chat
+from leoai.ai_intent_detection import IntentDetector, IntentType, RequestContext
+from leoai.rag_agent import DOCUMENT_CHAT_TOUCHPOINT_ID, RAGAgent
 from leoai.rag_context_manager import ContextManager
 from leoai.rag_knowledge_manager import KnowledgeRetriever
 from leoai.rag_prompt_builder import AgentOrchestrator, DOCUMENT_CHAT_INSTRUCTIONS
@@ -48,7 +49,21 @@ def make_document_agent():
     ("agent", "web_user", False),
 ])
 def test_document_mode_requires_both_fields(context, persona, expected):
-    assert is_document_chat(context, persona) is expected
+    response = {
+        "primary_intent": "document_chat" if expected else "general_chat",
+        "purpose": "generate_text",
+        "secondary_intents": [],
+        "confidence": 0.95,
+        "entities": {},
+        "needs_clarification": False,
+    }
+    result = IntentDetector(
+        ai_client=SimpleNamespace(generate_json=Mock(return_value=response))
+    ).detect(
+        "document question",
+        RequestContext(context=context, persona_id=persona),
+    )
+    assert (result.primary_intent is IntentType.DOCUMENT_CHAT) is expected
 
 
 @pytest.fixture

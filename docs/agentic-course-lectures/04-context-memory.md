@@ -121,7 +121,7 @@ Memory không phải là “ném toàn bộ lịch sử vào model”.
 
 ---
 
-# Example: document mode loại location
+# Example: `document_chat` loại location
 
 ```python
 await context.build_context_summary(
@@ -133,7 +133,8 @@ await context.build_context_summary(
 )
 ```
 
-Trong `AgentOrchestrator.build_document_prompt`, các field như
+`IntentDetector` chọn `document_chat` từ `context` và `persona_id`. Trong
+`AgentOrchestrator.build_document_prompt`, các field như
 `selected_place`, `nearby_places`, `latitude` và `longitude` tiếp tục bị lọc.
 
 ---

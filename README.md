@@ -24,12 +24,17 @@ LeoBot uses the configured AI provider for natural, context-aware responses.
 * **RAG and document chat:** Visitor-scoped knowledge retrieval, persistent
   conversation context, and authenticated web-page ingestion.
 * **Nearby place discovery:** Optional browser geolocation, bilingual
-  recommendations based on nearby place categories, and radius-aware PostGIS
-  search.
+  recommendations based on nearby place categories, radius-aware PostGIS
+  search, and name-focused full-text matching.
+* **Hybrid nearby search:** Exact place-name matches are returned separately
+  from vector-based `similar_places` recommendations; similar places never
+  replace or inflate the requested exact-match count.
 * **Background place enrichment:** Dagster searches for missing nearby results
   and enriches discovered places with grounded web context and place knowledge.
-* **FastAPI backend and Redis rate limiting:** Async API routes and per-visitor
-  request throttling.
+  Redis/SSE notifies the browser as soon as discovery commits places.
+* **FastAPI backend and Redis state:** Async API routes, per-visitor rate
+  limiting, five-minute duplicate-request response caching, and cache
+  invalidation when places or visitor knowledge change.
 * **Custom personas and touchpoints:** Context-aware conversations across
   profiles, roles, and channels.
 * **Prebuilt frontend demos:** Localized Jinja2 interfaces and embeddable chat
@@ -48,10 +53,15 @@ while Redis stores visitor state and enforces message rate limits.
 
 Nearby searches first query local place data. When the requested list is
 incomplete, the agent can submit the existing Dagster geo-places pipeline to
-discover and enrich more places without blocking the chat response. The web UI
-is split between [`leocdp.chatbot.js`](resources/js/leocdp.chatbot.js) for chat
-transport and [`leocdp.agents.js`](resources/js/leocdp.agents.js) for localized
-page behavior and location-aware recommendations.
+discover and enrich more places without blocking the chat response. Exact
+full-text name matches are returned in `places`; vector recommendations are
+returned in `similar_places` and shown as a separate labelled UI message.
+After PostgreSQL commits discovered places, the pipeline publishes a
+run-scoped Redis `PLACES_READY` event. The browser refreshes the latest
+question through the existing SSE endpoint before slower enrichment finishes.
+The web UI is split between [`leocdp.chatbot.js`](resources/js/leocdp.chatbot.js)
+for chat transport and [`leocdp.agents.js`](resources/js/leocdp.agents.js) for
+localized page behavior and location-aware recommendations.
 
 ---
 
@@ -70,6 +80,19 @@ standard conversation generation.
 ### Redis Rate Limiting
 
 Uses a sorted-set time window to prevent excessive messaging per user.
+
+### Request Response Cache
+
+`/_leoai/ask` and `/ask` use a visitor-scoped Redis cache with a 300-second
+TTL. Validation and rate limiting still run on every request. A matching
+request returns the complete JSON response without repeating intent detection,
+database search, AI generation, history writes, or Dagster submission.
+
+The cache fingerprint includes the request payload, normalized visitor,
+profile, and active touchpoint. A changed question, location, context, count,
+language, format, profile, or touchpoint misses the cache. Only successful
+responses are cached. Place discovery, knowledge ingestion, geolocation
+updates, and visitor-context changes invalidate affected cached responses.
 
 ---
 
@@ -271,6 +294,16 @@ FastAPI chatbot. It waits for Dagster and the chatbot health endpoint before
 reporting success. Dagster webserver and daemon logs are written under `logs/`;
 managed service PID files are kept in the ignored `.dagster-pids/` directory.
 
+Both `start_app.sh` and `start_dev.sh` call the shared PostgreSQL initializer.
+On every startup it applies [`leo360_schema.sql`](sql_scripts/leo360_schema.sql)
+first, then [`geo_places_search_indexes.sql`](sql_scripts/geo_places_search_indexes.sql),
+before launching the application. Each file runs in a separate `psql` session
+with `ON_ERROR_STOP=1`; concurrent index creation is not wrapped in a transaction.
+Missing SQL files or SQL errors stop startup. Development mode updates the
+repository before applying SQL so the database uses the current code's schema.
+The name-only full-text and knowledge-source lookup indexes are applied by
+[`geo_places_search_indexes.sql`](sql_scripts/geo_places_search_indexes.sql).
+
 Stop or restart both the chatbot and Dagster cluster with:
 
 ```bash
@@ -326,6 +359,35 @@ Development mode with sample place data:
 ./start_dev.sh --seed-data
 ```
 
+### Export and import geo-place data
+
+Use [`geo_places.sh`](geo_places.sh) to transfer the `public.geo_places` table
+between environments. The script reads `PGSQL_DB_URL` from `.env`; set
+`LEO_ENV_FILE` when using a different environment file. Make sure the target
+database has already been initialized with the canonical schema.
+
+```bash
+# Export the current database to data/geo_places/geo_places.sql
+./geo_places.sh --export data/geo_places
+
+# Import SQL/dump files from data/geo_places/
+./geo_places.sh --import data/geo_places
+```
+
+Export creates the destination folder and writes a data-only
+`data/geo_places/geo_places.sql` dump. Import applies every `.sql` file in
+lexical order, then restores PostgreSQL `.dump`, `.backup`, `.tar`, or `.dir`
+files found directly in the folder. SQL and restore errors stop the command.
+The script does not print database credentials.
+
+The import folder may contain a dump created by this script:
+
+```bash
+./geo_places.sh --export /tmp/leo-geo-places
+# Copy /tmp/leo-geo-places to the target environment, then:
+./geo_places.sh --import /tmp/leo-geo-places
+```
+
 LeoBot will run at `0.0.0.0:8888`.
 Open your browser and visit your configured `HOSTNAME` to test.
 
@@ -348,6 +410,46 @@ The geolocation response includes `recommended_actions`, a JSON array of
 bilingual quick actions based on nearby place categories. The browser renders
 these actions from the API response; when nearby category data is unavailable,
 the API provides general discovery suggestions.
+
+### Nearby search response contract
+
+For a nearby-place request, the API response can include:
+
+```json
+{
+  "places": [
+    {
+      "id": "place-id",
+      "name": "Miến ngon",
+      "distance_meters": 420
+    }
+  ],
+  "similar_places": [
+    {
+      "id": "similar-id",
+      "name": "Phở example",
+      "distance_meters": 600
+    }
+  ],
+  "similar_places_notice": "Similar suggestions, not name matches for your search."
+}
+```
+
+`places` contains full-text matches against place names within the requested
+radius. `similar_places` contains optional vector recommendations and is never
+mixed into `places` or counted as an exact match. The frontend renders vector
+recommendations separately so users can distinguish “matches” from “similar
+suggestions”.
+
+For example, a request for `5 quán miến ngon` can return exact name matches
+such as `Miến ngon`, `Miến trộn Đậu Đậu`, and `Miến xào Phúc Cua` in `places`.
+A phở or bún bò result can appear only in `similar_places`, with a separate
+recommendation notice; it must not be presented as a miến name match.
+
+When discovery is needed, the response may include `enrichment_run_id` and
+`enrichment_status_url`. The browser listens for `PLACES_READY` over SSE and
+automatically repeats the latest question after places are committed. `SUCCESS`
+remains a fallback for a completed Dagster run.
 
 ### Import a web page into document chat
 
@@ -421,23 +523,29 @@ the existing location-aware behavior. `temperature_score` is passed to generatio
 ```
 
 An optional positive integer `result_limit` overrides the count in the question.
-The search uses supplied coordinates or the visitor's saved touchpoint, keyword
-matches in place names/categories/descriptions/tags, and PostGIS radius/distance
-filtering. Results are nearest-first; there may be fewer than requested within
-`NEARBY_PLACES_RADIUS_METERS`. Missing location prompts the visitor to share it.
+The search uses supplied coordinates or the visitor's saved touchpoint,
+PostgreSQL full-text matching against **place names**, and PostGIS
+radius/distance filtering. Results are nearest-first; there may be fewer than
+requested within `NEARBY_PLACES_RADIUS_METERS`. Missing location prompts the
+visitor to share it. Descriptions, categories, and tags do not turn a place
+into an exact name match.
 HTML answers contain an escaped ordered list (`<ol>` / `<li>`); `text` answers
 remain numbered plain text. Each bold place name in an HTML answer links to a
 Google Search for its name and address. Nearby searches query PostgreSQL
 directly without AI generation, summarization, or embedding requests.
 
-If the local search returns fewer places than requested, the RAG agent submits
-the existing Dagster `geo_places_pipeline` to discover more. The run requests
-only the missing count, capped at five additional places. Any places already
-found remain in the answer alongside a notice that more are being searched for.
-The API does not wait for the run; a later question checks the database again.
-Dagster submission failures are surfaced instead of returning a success-shaped
-queued notice. Start Dagster with `./start_dagster.sh` and configure its worker
-environment as described in [`dags_pipelines/README.md`](dags_pipelines/README.md).
+If the local name search returns fewer places than requested, the RAG agent
+submits the existing Dagster `geo_places_pipeline` to discover more. The run
+requests the missing count, capped at five places, and asks the provider for an
+extra candidate pool to account for duplicates and filtering. Any exact places
+already found remain in `places`; vector recommendations remain independent.
+The API returns immediately. After `process_places` commits, Redis publishes
+`PLACES_READY`, invalidates the relevant response-cache revision, and the
+browser automatically repeats the latest question through SSE. Dagster
+submission failures are surfaced instead of returning a success-shaped queued
+notice. Start Dagster with `./start_dagster.sh` and configure its worker
+environment as described in
+[`dags_pipelines/README.md`](dags_pipelines/README.md).
 
 When a greeting presents the five-place picker, the backend saves the exact
 numbered choices. Choosing `4` saves that place as `selected_place` for the
@@ -457,6 +565,27 @@ env/bin/python -m pytest -q \
 env/bin/python -m pytest -q tests/test_conversation_context.py tests/test_ai_core.py
 env/bin/python -m pytest -q tests/test_document_chat.py
 node --test tests/leocdp.chatbot.test.cjs
+```
+
+Response-cache, hybrid-search, readiness-event, and startup SQL checks:
+
+```bash
+env/bin/python -m pytest -q \
+  tests/test_chat_response_cache.py \
+  tests/test_hybrid_places.py \
+  tests/test_geo_place_events.py \
+  tests/test_startup_sql.py
+node --test tests/leocdp.chatbot.test.cjs
+```
+
+Opt-in integration checks use rollback-only schemas and isolated Redis keys:
+
+```bash
+RUN_NEARBY_DB_TESTS=1 RUN_REDIS_EVENT_TESTS=1 \
+  env/bin/python -m pytest -q \
+  tests/test_chat_response_cache.py \
+  tests/test_hybrid_places.py \
+  tests/test_geo_place_events.py
 ```
 
 Optional PostGIS validation uses a temporary schema that is rolled back:
@@ -488,6 +617,8 @@ RUN_DOCUMENT_DB_TESTS=1 env/bin/python -m pytest -q tests/test_document_chat.py
 * Touchpoint metadata embeddings use a separate 768-dimensional configuration;
   existing chat/context embeddings remain 768-dimensional.
 * Compatible with **pgvector** and other vector databases.
+* Geo-place embeddings are generated in the background after fast place data
+  commits; pending knowledge chunks are not used for vector retrieval.
 * The browser chatbot can request HTML5 geolocation permission. Coordinates are
   stored as PostGIS touchpoints, and nearby rows from `geo_places` are included in
   the conversation context. If permission is denied, normal chat continues
@@ -531,7 +662,7 @@ curl -X POST http://localhost:8000/ask \
 
 * [ ] Support Telegram, LINE, and WhatsApp
 * [ ] Add knowledge-graph search (PostgreSQL + pgvector)
-* [ ] Streaming chat via SSE/WebSocket
+* [x] Geo-place readiness notifications via Redis/SSE
 * [ ] AI analytics dashboard for admins
 * [ ] Plugin SDK for external integrations
 

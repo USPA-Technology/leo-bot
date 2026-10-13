@@ -12,7 +12,10 @@ from urllib.parse import urlencode
 from dagster_graphql import DagsterGraphQLClient
 
 from leoai.ai_core import AIClient
-from leoai.rag_db_manager import NEARBY_PLACES_LIMIT, NEARBY_PLACES_RADIUS_METERS
+from leoai.rag_db_manager import (
+    NEARBY_PLACES_LIMIT,
+    NEARBY_PLACES_RADIUS_METERS,
+)
 
 logger = logging.getLogger(__name__)
 GEO_PLACES_PIPELINE_JOB = "geo_places_pipeline"
@@ -23,6 +26,11 @@ GEO_PLACES_PIPELINE_ASSETS = [
     "process_knowledge",
 ]
 MAX_GEO_PLACES_ENRICHMENT = 5
+NEARBY_RADIUS_PATTERN = re.compile(
+    r"\b(?:within|in|trong)\s+(?:(?:a|the)\s+)?(?:(?:radius\s+of|bán\s+kính)\s+)?"
+    r"(\d+(?:[.,]\d+)?)\s*(km|kilometers?|kilometres?|m|meters?|metres?|mét)\b",
+    re.IGNORECASE,
+)
 
 GREETING_PATTERN = re.compile(
     r"^(?:hi|hello|hey|xin chao|xin chào|chao|chào|good morning|"
@@ -34,10 +42,14 @@ PLACE_SELECTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 NEARBY_QUERY_PATTERN = re.compile(
-    r"\b(?:near\s+me|nearby|near\s+here|close\s+(?:to\s+me|by)|"
-    r"around\s+(?:me|here)|in\s+(?:my|this)\s+(?:area|neighbou?rhood)|"
-    r"gan\s+(?:toi|minh|day|khu\s+vuc)|xung\s+quanh(?:\s+(?:toi|day))?|"
-    r"quanh\s+(?:toi|day))\b",
+    r"\b(?:near(?:\s+to)?\s+(?:(?:the|a|an|my|our)\s+)?[\w'-]+|nearby|"
+    r"close\s+(?:by|to\s+(?:(?:the|a|an|my|our)\s+)?[\w'-]+)|"
+    r"around\s+(?:(?:the|a|an|my|our)\s+)?[\w'-]+|"
+    r"(?:within|trong)\s+\d+(?:[.,]\d+)?\s*(?:km|kilometers?|kilometres?|m|meters?|metres?|mét)|"
+    r"in\s+(?:my|this)\s+(?:area|neighbou?rhood)|"
+    r"gan\s+(?:toi|minh|day|khu\s+vuc|[\w'-]+)|"
+    r"xung\s+quanh(?:\s+(?:toi|day|[\w'-]+))?|"
+    r"quanh\s+(?:toi|day|[\w'-]+))\b",
     re.IGNORECASE,
 )
 NEARBY_INTENT_SCHEMA = {
@@ -54,6 +66,8 @@ GENERIC_PLACE_TERMS = {
     "cafes",
     "eatery",
     "food",
+    "noodle",
+    "noodles",
     "place",
     "places",
     "quán",
@@ -70,7 +84,9 @@ activity, business, and place categories.
 Return only the requested JSON fields. Extract the user's specific category as
 short search terms and a concise search_name. Prefer exact intent over parent
 categories: ramen is not generic restaurant/food; bubble tea is not generic
-cafe; a named cuisine is not any restaurant. Add only close synonyms that
+cafe; miến (glass noodles) is not phở, bún bò, or generic noodles.
+Preserve a named dish as the name-search term; "ngon" is a quality preference,
+not part of the dish name. A named cuisine is not any restaurant. Add only close synonyms that
 would still be relevant matches. Do not add broad terms such as "food",
 "restaurant", "place", or "quán" when the user specified a narrower category.
 For an unqualified nearby-places request, use empty terms and search_name
@@ -126,6 +142,39 @@ def classify_nearby_place_intent(
     ):
         raise RuntimeError("AI returned an incomplete nearby-place classification.")
 
+    return normalize_nearby_place_intent(is_nearby, raw_terms, search_name)
+
+
+def nearby_place_intent_from_entities(entities: dict[str, Any]) -> dict[str, Any]:
+    """Build a nearby-search request from validated top-level intent entities."""
+    search_terms = entities.get("search_terms", [])
+    if not isinstance(search_terms, list) or any(
+        not isinstance(term, str) for term in search_terms
+    ):
+        search_terms = []
+    place_type = entities.get("place_type")
+    search_name = entities.get("search_name")
+    if not isinstance(place_type, str):
+        place_type = ""
+    if not isinstance(search_name, str):
+        search_name = ""
+    if not search_terms and place_type:
+        search_terms = [place_type]
+    if not search_name:
+        search_name = place_type or (search_terms[0] if search_terms else "places")
+    nearby_intent = normalize_nearby_place_intent(True, search_terms, search_name)
+    for key in ("result_limit", "radius_meters"):
+        if key in entities:
+            nearby_intent[key] = entities[key]
+    return nearby_intent
+
+
+def normalize_nearby_place_intent(
+    is_nearby: bool,
+    raw_terms: list[str],
+    search_name: str,
+) -> dict[str, Any]:
+    """Sanitize place categories and search name from any classifier source."""
     terms = []
     for term in raw_terms[:6]:
         clean_term = re.sub(r"[^\w\s'-]", "", term, flags=re.UNICODE)
@@ -154,14 +203,6 @@ def classify_nearby_place_intent(
         "terms": terms,
         "search_name": clean_search_name,
     }
-
-
-def is_document_chat(context: str, persona_id: str | None) -> bool:
-    """Return whether the request belongs to the document-chat touchpoint."""
-    return (
-        context.strip().lower() == "agent"
-        and (persona_id or "").strip().lower() == "personal_assistant"
-    )
 
 
 def is_greeting_message(message: str) -> bool:
@@ -198,8 +239,13 @@ def is_nearby_place_question(
     ]
 
 
-def nearby_result_limit(message: str, explicit_limit: int | None = None) -> int:
-    """Resolve the requested result count, preferring an explicit API value."""
+def nearby_result_limit(
+    message: str,
+    explicit_limit: int | None = None,
+    *,
+    intent_limit: int | None = None,
+) -> int:
+    """Resolve API override, then the count in the message, then AI, then default."""
     if explicit_limit is not None:
         limit = explicit_limit
     else:
@@ -211,7 +257,7 @@ def nearby_result_limit(message: str, explicit_limit: int | None = None) -> int:
                 r"caf[eé]s?|coffee(?:\s+shops?)?|restaurants?|nhà\s+thờ|nha\s+tho|"
                 r"địa\s+điểm|cà\s+phê|chùa|chợ|noodles?|"
                 r"quán\s+m[iìíỉĩị]|quán\s+m[ỳýỷỹỵ]|"
-                r"quan\s+(?:mi|my))\b",
+                r"quán\s+miến|quán\s+ph(?:ở|o)|quan\s+(?:mien|mi|my))\b",
                 message,
                 re.IGNORECASE,
             )
@@ -222,6 +268,8 @@ def nearby_result_limit(message: str, explicit_limit: int | None = None) -> int:
                 raise ValueError(
                     "Requested place count must be a positive integer."
                 ) from exc
+        elif intent_limit is not None:
+            limit = intent_limit
         else:
             limit = NEARBY_PLACES_LIMIT
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
@@ -229,22 +277,30 @@ def nearby_result_limit(message: str, explicit_limit: int | None = None) -> int:
     return limit
 
 
-def nearby_radius_meters(message: str) -> float:
-    """Parse a positive metric search radius, or use the configured default."""
-    match = re.search(
-        r"(?<![\w.])([+-]?\d+(?:[.,]\d+)?)\s*"
-        r"(kilometers?|kilometres?|km|meters?|metres?|mét|m)\b",
-        message,
-        re.IGNORECASE,
-    )
-    if match is None:
-        return float(NEARBY_PLACES_RADIUS_METERS)
-    radius = float(match.group(1).replace(",", "."))
-    if match.group(2).lower().startswith("k"):
-        radius *= 1000
-    if not math.isfinite(radius) or radius <= 0:
+def positive_finite_radius_meters(value: Any) -> float:
+    """Validate and normalize a radius already expressed in meters."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
         raise ValueError("Requested search radius must be positive and finite.")
-    return radius
+    return float(value)
+
+
+def nearby_radius_meters(message: str, intent_radius_meters: Any | None = None) -> float:
+    """Prefer a radius written in the message, then AI-extracted meters, then default."""
+    match = NEARBY_RADIUS_PATTERN.search(message)
+    if match is not None:
+        value = float(match.group(1).replace(",", "."))
+        unit = match.group(2).casefold()
+        radius = value * 1000 if unit.startswith("k") else value
+        return positive_finite_radius_meters(radius)
+    if intent_radius_meters is not None:
+        return positive_finite_radius_meters(intent_radius_meters)
+    return float(NEARBY_PLACES_RADIUS_METERS)
+
 
 
 def geo_places_search_name(
@@ -292,6 +348,7 @@ def build_geo_places_pipeline_run_config(
                     "longitude": longitude,
                     "radius": radius,
                     "count": bounded_count,
+                    "candidate_count": min(50, max(10, bounded_count * 3)),
                 }
             },
             "process_brave_search": {

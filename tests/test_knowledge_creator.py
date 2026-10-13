@@ -348,6 +348,7 @@ def api(monkeypatch):
 
 
 def test_update_api_requires_auth_and_valid_query(api):
+    from leobot_router import leobot_knowledge_router as routes
     client, app, creator = api
     params = {"url": URL, "source_type": "web_page", "visitor_id": "visitor"}
     assert client.post("/_leoai/update-knowledge", params=params).status_code == 401
@@ -369,6 +370,7 @@ def test_update_api_requires_auth_and_valid_query(api):
     creator.upsert_url.assert_awaited_once_with(
         URL, visitor_id="visitor", source_type=KnowledgeSourceType.WEB_PAGE, name=None,
     )
+    routes.chat_response_cache.invalidate_visitor.assert_awaited_once_with("visitor")
     assert client.get("/_leoai/update-knowledge", params=params).status_code == 405
     for overrides in [{"visitor_id": ""}, {"visitor_id": " "}, {"visitor_id": "a" * 51},
                       {"url": "not a URL"}, {"source_type": "unknown"}]:

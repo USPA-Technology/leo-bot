@@ -589,6 +589,21 @@ CREATE INDEX IF NOT EXISTS places_region_ix        ON geo_places (tenant_id, reg
 CREATE INDEX IF NOT EXISTS places_pluscode_ix      ON geo_places (pluscode);
 CREATE INDEX IF NOT EXISTS places_tags_gin         ON geo_places USING GIN (tags);
 CREATE INDEX IF NOT EXISTS places_name_trgm_gin    ON geo_places USING GIN (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS places_text_search_gin ON geo_places USING GIN (
+    to_tsvector(
+        'simple',
+        coalesce(name, '') || ' ' || coalesce(description, '') || ' ' ||
+        coalesce(category, '')
+    )
+);
+CREATE INDEX IF NOT EXISTS places_name_search_gin ON geo_places USING GIN (
+    to_tsvector('simple', coalesce(name, ''))
+);
+CREATE INDEX IF NOT EXISTS knowledge_sources_geo_place_lookup_ix
+ON knowledge_sources (tenant_id, (metadata->>'geo_place_id'))
+WHERE status = 'active'
+  AND (metadata->>'source' = 'geo_places'
+       OR metadata->>'provider' = 'brave_search');
 CREATE INDEX IF NOT EXISTS places_schedule_operation_gin
     ON geo_places USING GIN (schedule_operation jsonb_path_ops);
 -- enrichment work queues ("what is left to do")

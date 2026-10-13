@@ -17,11 +17,20 @@ import structlog
 # Load environment variables from .env file
 load_dotenv(override=True)
 
-# --- Loggin ---
+# --- Logging ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+
+
 def setup_logging():
+    level = getattr(logging, LOG_LEVEL, None)
+    if not isinstance(level, int):
+        raise ValueError(
+            f"Invalid LOG_LEVEL '{LOG_LEVEL}'. "
+            "Use DEBUG, INFO, WARNING, ERROR, or CRITICAL."
+        )
     logging.basicConfig(
         format="%(message)s",
-        level=logging.INFO
+        level=level,
     )
     structlog.configure(
         processors=[
@@ -40,8 +49,10 @@ HOSTNAME = os.getenv("HOSTNAME", "localhost")
 LEO_DATA_ENRICHMENT_KEY = os.getenv("LEO_DATA_ENRICHMENT_KEY")
 
 # --- Rate Limiting ---
-RATE_LIMIT_MAX_MESSAGES = 20  # max messages
-RATE_LIMIT_WINDOW_SECONDS = 60  # time window
+RATE_LIMIT_MAX_MESSAGES = int(os.getenv("RATE_LIMIT_MAX_MESSAGES", "20"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+CHAT_MAX_MESSAGE_LENGTH = int(os.getenv("CHAT_MAX_MESSAGE_LENGTH", "1000"))
+CHAT_MAX_VISITOR_ID_LENGTH = int(os.getenv("CHAT_MAX_VISITOR_ID_LENGTH", "255"))
 
 # --- Redis ---
 REDIS_HOST = os.getenv("REDIS_USER_SESSION_HOST") or "localhost"

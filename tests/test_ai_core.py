@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from leoai import ai_core
+from leoai.ai_intent_detection import IntentDetector
 
 
 def test_remote_embedding_model_batches_normalizes_and_orders_results(monkeypatch):
@@ -142,6 +143,59 @@ def test_google_json_schema_omits_unsupported_additional_properties(monkeypatch)
     assert result == {"found": False}
     schema = models.kwargs["config"].response_schema
     assert "additional_properties" not in str(schema).lower()
+
+
+def test_google_intent_schema_preserves_location_entity_fields(monkeypatch):
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            self.kwargs = kwargs
+            return SimpleNamespace(text="{}")
+
+    models = FakeModels()
+    monkeypatch.setattr(
+        ai_core, "_get_api_client",
+        lambda provider, api_key: SimpleNamespace(models=models),
+    )
+    client = ai_core.AIClient(provider="google", model_name="test", api_key="key")
+
+    client.generate_json("Classify this request.", IntentDetector._JSON_SCHEMA)
+
+    entity_schema = (
+        models.kwargs["config"]
+        .response_schema["properties"]["entities"]
+    )
+    entity_properties = entity_schema["properties"]
+    assert entity_schema["type"] == "OBJECT"
+    assert entity_properties["place_type"]["type"] == "STRING"
+    assert entity_properties["search_name"]["type"] == "STRING"
+    assert entity_properties["search_terms"]["type"] == "ARRAY"
+    assert entity_properties["search_terms"]["items"]["type"] == "STRING"
+
+
+def test_openai_intent_json_prompt_includes_location_entity_fields(monkeypatch):
+    class FakeCompletions:
+        def create(self, **kwargs):
+            self.kwargs = kwargs
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))]
+            )
+
+    completions = FakeCompletions()
+    monkeypatch.setattr(
+        ai_core,
+        "_get_api_client",
+        lambda provider, api_key: SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        ),
+    )
+    client = ai_core.AIClient(provider="openai", model_name="test", api_key="key")
+
+    client.generate_json("Classify this request.", IntentDetector._JSON_SCHEMA)
+
+    user_prompt = completions.kwargs["messages"][-1]["content"]
+    assert '"place_type"' in user_prompt
+    assert '"search_terms"' in user_prompt
+    assert '"search_name"' in user_prompt
 
 
 def test_google_json_schema_converts_nullable_union_types(monkeypatch):

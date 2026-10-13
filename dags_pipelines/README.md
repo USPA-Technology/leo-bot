@@ -98,6 +98,15 @@ The general-purpose assets do the following:
    A discovery result without coordinates is still stored with a NULL `geom`;
    `process_brave_search` performs a follow-up place search to recover
    coordinates before continuing enrichment.
+   Chat-triggered runs request a bounded candidate pool (`candidate_count`,
+   normally 10-15) in one provider call so duplicates and filtered results do not
+   consume the entire requested result count. Manual runs keep their existing
+   `count` behavior unless `candidate_count` is supplied.
+   After the upsert transaction commits, this asset publishes `PLACES_READY`
+   through Redis on `geo-places:discovery:<run_id>`. The same event is retained
+   for one hour for late SSE subscribers. The browser rechecks saved places
+   immediately; it does not wait for web lookup, schedules, or vector generation.
+   A Redis failure is logged and the SSE route falls back to Dagster run status.
 2. **`process_brave_search`** searches Brave's grounded web context for one
    place at a time. Each place is committed to PostgreSQL before the next place
    is searched, so a later failure does not roll back earlier results. Each
@@ -117,7 +126,7 @@ The general-purpose assets do the following:
    to PostgreSQL. It upserts one `knowledge_sources` record and its
    768-dimensional `knowledge_chunks` per place. It processes and commits one
    place at a time. Pipeline-owned sources use user `geo_places_pipeline` and
-   tenant `default`.
+   tenant `global`.
 
 The required search config and optional result count look like:
 
@@ -206,8 +215,8 @@ ops:
 When nearby chat has no matching local places or fewer results than requested,
 the RAG agent submits the existing `geo_places_pipeline` asset job and returns
 a search-queued notice after Dagster accepts the run. For partial results, the
-response keeps the places already found. It does not wait for completion; a
-later question checks the database again.
+response keeps the places already found. It does not wait for completion; the
+browser uses SSE readiness to recheck the database as soon as discovery commits.
 
 ```text
 process_places
@@ -218,7 +227,8 @@ process_places
 The trigger explicitly selects and runs all four existing assets. Every run
 config carries the requested category, center, radius, and at most five
 additional places (only the number missing from the request when fewer) through
-discovery and the downstream database selectors. `process_places` stores
+the downstream database selectors. Discovery requests extra candidates to allow
+for existing places, duplicates, and filtering. `process_places` stores
 the requested category (for example `Ramen`) instead of forcing `Church`.
 `process_brave_search` and `process_knowledge` handle the requested place type;
 `process_mass_schedule` runs as part of the job but skips non-church categories.

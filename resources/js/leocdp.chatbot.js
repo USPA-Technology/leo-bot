@@ -534,6 +534,11 @@ class ChatbotController {
             );
           }
           processAnswer(answer);
+          if (Array.isArray(data.similar_places) &&
+              data.similar_places.length > 0 &&
+              data.similar_places_answer) {
+            processAnswer(data.similar_places_answer);
+          }
           if (data.enrichment_status_url) {
             watchGeoPlacesEnrichment(data.enrichment_status_url);
           }
@@ -594,77 +599,153 @@ var showChatBotLoader = function () {
   return getBotUI().message.add({ loading: true, content: "" });
 };
 
+
 // Own the SSE lifecycle and translate Dagster states into chat messages.
 class GeoPlacesEnrichmentWatcher {
   constructor(state, uiProvider, questionSender) {
     this.state = state;
     this.uiProvider = uiProvider;
     this.questionSender = questionSender;
+
     this.terminalStatuses = ["SUCCESS", "FAILURE", "CANCELED"];
+
     this.messages = {
-      QUEUED: [
-        "The place search is queued.",
-        "Yêu cầu tìm kiếm địa điểm đang chờ xử lý.",
-      ],
-      NOT_STARTED: [
-        "The place search has not started yet.",
-        "Quá trình tìm kiếm địa điểm chưa bắt đầu.",
-      ],
-      MANAGED: [
-        "The place search is waiting for a worker.",
-        "Quá trình tìm kiếm địa điểm đang chờ worker xử lý.",
-      ],
-      STARTING: [
-        "The place search is starting.",
-        "Quá trình tìm kiếm địa điểm đang khởi chạy.",
-      ],
-      STARTED: [
-        "The place search is running. I will update you when it finishes.",
-        "Đang tìm kiếm địa điểm. Mình sẽ báo bạn khi hoàn tất.",
-      ],
-      CANCELING: [
-        "The place search is being canceled.",
-        "Quá trình tìm kiếm địa điểm đang được hủy.",
-      ],
-      SUCCESS: [
-        "The place search is complete. Ask again to see the updated results.",
-        "Quá trình tìm kiếm địa điểm đã hoàn tất. Hãy hỏi lại để xem kết quả mới.",
-      ],
-      FAILURE: [
-        "The place search could not be completed. You can try again later.",
-        "Quá trình tìm kiếm địa điểm không hoàn tất. Bạn có thể thử lại sau.",
-      ],
-      CANCELED: [
-        "The place search was canceled. You can try again later.",
-        "Quá trình tìm kiếm địa điểm đã bị hủy. Bạn có thể thử lại sau.",
-      ],
-      STATUS_UNAVAILABLE: [
-        "I could not check the place search status. Please try again later.",
-        "Mình chưa thể kiểm tra trạng thái tìm kiếm địa điểm. Bạn hãy thử lại sau.",
-      ],
+      QUEUED: {
+        text: [
+          "Place search added to queue.",
+          "Yêu cầu tìm địa điểm đã được đưa vào hàng đợi.",
+        ],
+        icon: "bi-hourglass-split",
+        color: "info",
+      },
+      NOT_STARTED: {
+        text: [
+          "Place search hasn't started.",
+          "Tìm kiếm địa điểm chưa bắt đầu.",
+        ],
+        icon: "bi-hourglass-split",
+        color: "info",
+      },
+      MANAGED: {
+        text: [
+          "Waiting for a worker.",
+          "Đang chờ worker xử lý.",
+        ],
+        icon: "bi-hourglass-split",
+        color: "info",
+      },
+      STARTING: {
+        text: [
+          "Starting place search…",
+          "Đang khởi tạo tìm kiếm địa điểm…",
+        ],
+        icon: "bi-arrow-repeat",
+        color: "info",
+        loading: true,
+      },
+      STARTED: {
+        text: [
+          "Searching nearby places…",
+          "Đang tìm địa điểm gần bạn…",
+        ],
+        icon: "bi-geo-alt-fill",
+        color: "primary",
+        loading: true,
+      },
+      CANCELING: {
+        text: [
+          "Canceling place search…",
+          "Đang hủy tìm kiếm địa điểm…",
+        ],
+        icon: "bi-x-circle",
+        color: "warning",
+      },
+      SUCCESS: {
+        text: [
+          "Places updated. Ask again for results.",
+          "Địa điểm đã được cập nhật. Hãy hỏi lại để xem kết quả.",
+        ],
+        icon: "bi-check-circle-fill",
+        color: "success",
+      },
+      PLACES_READY: {
+        text: [
+          "Place discovery finished. Checking saved results.",
+          "Đã hoàn tất tìm kiếm địa điểm. Đang kiểm tra kết quả đã lưu.",
+        ],
+        icon: "bi-check-circle-fill",
+        color: "success",
+      },
+      FAILURE: {
+        text: [
+          "Place search failed. Try again later.",
+          "Tìm kiếm địa điểm thất bại. Vui lòng thử lại sau.",
+        ],
+        icon: "bi-exclamation-triangle-fill",
+        color: "danger",
+      },
+      CANCELED: {
+        text: [
+          "Place search canceled.",
+          "Đã hủy tìm kiếm địa điểm.",
+        ],
+        icon: "bi-x-circle",
+        color: "warning",
+      },
+      STATUS_UNAVAILABLE: {
+        text: [
+          "Search status unavailable. Try again later.",
+          "Không thể kiểm tra trạng thái tìm kiếm. Vui lòng thử lại sau.",
+        ],
+        icon: "bi-exclamation-circle-fill",
+        color: "warning",
+      },
     };
+
     this.refreshSuccessMessages = [
-      "The place search is complete. I’m checking updated results for your latest question.",
-      "Quá trình tìm kiếm địa điểm đã hoàn tất. Mình đang cập nhật kết quả cho câu hỏi gần nhất.",
+      "Places updated; checking your latest question…",
+      "Địa điểm đã cập nhật; đang xử lý câu hỏi mới nhất…",
     ];
   }
 
   // Add a localized chat message for one Dagster status.
   showStatus(status, willRefreshResults) {
-    var localizedMessages =
-      status === "SUCCESS" && willRefreshResults
-        ? this.refreshSuccessMessages
-        : this.messages[status];
-    if (!localizedMessages) {
+    let statusMessage = this.messages[status];
+
+    if (!statusMessage) {
       console.warn("Unknown geo-place enrichment status:", status);
-      localizedMessages = this.messages.STATUS_UNAVAILABLE;
+      statusMessage = this.messages.STATUS_UNAVAILABLE;
     }
+
+    const language = getLeoUiLanguage();
+    const languageIndex = language === "en" ? 0 : 1;
+
+    const localizedMessage =
+      (status === "SUCCESS" || status === "PLACES_READY") && willRefreshResults
+        ? this.refreshSuccessMessages[languageIndex]
+        : statusMessage.text[languageIndex];
+
+    // Use Bootstrap's animated spinner for active processing states.
+    const statusIcon = statusMessage.loading
+      ? '<span class="spinner-border spinner-border-sm flex-shrink-0" ' +
+        'aria-hidden="true"></span>'
+      : '<i class="bi ' +
+        statusMessage.icon +
+        ' fs-5 flex-shrink-0" aria-hidden="true"></i>';
 
     this.uiProvider().message.add({
       human: false,
-      cssClass: "leobot-answer",
-      content: localizedMessages[getLeoUiLanguage() === "en" ? 0 : 1],
-      type: "text",
+      cssClass: "leobot-answer geo-enrichment-status",
+      content:
+        '<div class="alert alert-' +
+        statusMessage.color +
+        ' d-flex align-items-center gap-2 py-2 px-3 mb-0" role="status">' +
+        statusIcon +
+        "<span>" +
+        localizedMessage +
+        "</span>" +
+        "</div>",
+      type: "html",
     });
   }
 
@@ -704,10 +785,12 @@ class GeoPlacesEnrichmentWatcher {
       return;
     }
 
+    var placesReady =
+      update.status === "SUCCESS" || update.status === "PLACES_READY";
     var refreshQuestion =
-      update.status === "SUCCESS" ? this.state.getQuestionToRefresh() : null;
+      placesReady ? this.state.getQuestionToRefresh() : null;
     this.showStatus(update.status, Boolean(refreshQuestion));
-    if (this.terminalStatuses.indexOf(update.status) >= 0) {
+    if (placesReady || this.terminalStatuses.indexOf(update.status) >= 0) {
       eventSource.close();
     }
     if (refreshQuestion) {

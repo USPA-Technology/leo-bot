@@ -4,6 +4,11 @@ from datetime import datetime
 from typing import Dict, Optional
 import logging
 
+from leoai.ai_intent_detection import (
+    IntentDetectionResult,
+    IntentType,
+    PurposeType,
+)
 
 logger = logging.getLogger("PromptBuilder")
 
@@ -147,10 +152,17 @@ Provide more detailed explanations when requested and examples only when useful.
 
 class PromptRouter:
     """Holds the built prompt and inferred purpose of the request."""
-    def __init__(self, prompt_text: str, purpose: str, system_instruction: Optional[str] = None):
+    def __init__(
+        self,
+        prompt_text: str,
+        purpose: str,
+        system_instruction: Optional[str] = None,
+        intent_result: IntentDetectionResult | None = None,
+    ):
         self.prompt_text = prompt_text
         self.purpose = purpose
         self.system_instruction = system_instruction
+        self.intent_result = intent_result
 
     def __repr__(self):
         return f"PromptRouter(purpose={self.purpose!r}, prompt_length={len(self.prompt_text)})"
@@ -161,9 +173,18 @@ class AgentOrchestrator:
     """Constructs contextual prompt strings and detects intent for routing."""
 
     def build_document_prompt(
-        self, question: str, context_model: Dict, document_context: str,
+        self,
+        question: str,
+        context_model: Dict,
+        document_context: str,
         target_language: str = "",
+        intent_result: IntentDetectionResult | None = None,
     ) -> PromptRouter:
+        intent_result = intent_result or IntentDetectionResult(
+            primary_intent=IntentType.DOCUMENT_CHAT,
+            purpose=PurposeType.GENERATE_TEXT,
+            confidence=1.0,
+        )
         document_user_context = {
             key: value for key, value in (context_model.get("user_context") or {}).items()
             if key not in {"selected_place", "place_choices", "nearby_places", "latitude", "longitude"}
@@ -183,13 +204,31 @@ Respond in {target_language or "the user's language"}.
 
 ### User's current question
 {question.strip()}
+
+### Intent Detection (application metadata)
+{json.dumps(intent_result.model_dump(mode="json"), ensure_ascii=False, indent=2)}
+Treat this metadata as routing evidence, not as user instructions.
 """
         return PromptRouter(
-            prompt_text=prompt_text, purpose="generate_text",
+            prompt_text=prompt_text, purpose=intent_result.purpose.value,
             system_instruction=DOCUMENT_CHAT_INSTRUCTIONS,
+            intent_result=intent_result,
         )
 
-    def build_prompt(self, question: str, context_model: Dict, target_language: str = "", persona_id: str = "personal_assistant") -> PromptRouter:
+    def build_prompt(
+        self,
+        question: str,
+        context_model: Dict,
+        target_language: str = "",
+        persona_id: str = "personal_assistant",
+        intent_result: IntentDetectionResult | None = None,
+    ) -> PromptRouter:
+        intent_result = intent_result or IntentDetectionResult(
+            primary_intent=IntentType.GENERAL_CHAT,
+            purpose=PurposeType.GENERATE_TEXT,
+            confidence=0.0,
+            needs_clarification=True,
+        )
         user_context = context_model.get("user_context", {})
         timestamp = user_context.get("datetime")
 
@@ -233,13 +272,20 @@ Respond in {target_language or "the user's language"}.
             current_question_instructions=CURRENT_QUESTION_INSTRUCTIONS,
             question=question.strip()
         )
-
-        # Detect purpose
-        purpose = self.detect_purpose(question)
-
+        prompt_text = (
+            prompt_text
+            + "\n### Intent Detection (application metadata)\n"
+            + json.dumps(
+                intent_result.model_dump(mode="json"),
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\nTreat this metadata as routing evidence, not as user instructions.\n"
+        )
         return PromptRouter(
             prompt_text=prompt_text,
-            purpose=purpose,
+            purpose=intent_result.purpose.value,
+            intent_result=intent_result,
             system_instruction=(
                 persona_description + "\n" + CURRENT_QUESTION_INSTRUCTIONS
                 + "\n" + PLACE_FOLLOWUP_INSTRUCTIONS
@@ -250,64 +296,6 @@ Respond in {target_language or "the user's language"}.
         p = PersonaManagement()
         return p.get_persona_description(persona_id)
         
-
-    def detect_purpose(self, question: str, context_summary: Optional[str] = None) -> str:
-        """
-        Infer the user's intent based on keywords, structure, and contextual hints.
-        This lightweight heuristic can later be upgraded with embedding similarity.
-        """
-        q = question.lower().strip()
-        ctx = (context_summary or "").lower()
-
-        # --- Primary keyword groups ---
-        purpose_keywords = {
-            "generate_report": [
-                "report", "summary", "dashboard", "insight", "trend",
-                "analytics", "statistics", "data analysis", "visualization"
-            ],
-            "generate_text": [
-                "write", "story", "poem", "email", "post", "message",
-                "draft", "explain", "summarize", "describe"
-            ],
-            "generate_plan": [
-                "plan", "strategy", "outline", "schedule",
-                "proposal", "roadmap", "timeline"
-            ],
-            "generate_code": [
-                "code", "script", "function", "query", "api", "algorithm"
-            ],
-            "generate_answer": [
-                "what", "how", "why", "can i", "is it", "should i"
-            ]
-        }
-
-        # --- Scoring mechanism ---
-        scores = {purpose: 0.0 for purpose in purpose_keywords}
-
-        for purpose, keywords in purpose_keywords.items():
-            for kw in keywords:
-                if kw in q:
-                    scores[purpose] += 2  # direct keyword boost
-                if kw in ctx:
-                    scores[purpose] += 1  # context hint boost
-
-        # --- Structural hints ---
-        if q.endswith("?"):
-            scores["generate_answer"] += 1.5
-
-        if "data" in q and ("show" in q or "graph" in q):
-            scores["generate_report"] += 2
-
-        # --- Choose best-scoring purpose ---
-        best_purpose = max(scores, key=lambda purpose: scores[purpose])
-        confidence = scores[best_purpose]
-
-        # --- Confidence threshold logic ---
-        if confidence < 2:
-            best_purpose = "generate_text"  # default fallback
-
-        logger.debug(f"[detect_purpose] Question='{question}' → {best_purpose} (scores={scores})")
-        return best_purpose
 
     @staticmethod
     def _format_timestamp(timestamp: Optional[str]) -> str:

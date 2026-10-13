@@ -5,7 +5,9 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import HttpUrl, StringConstraints
+from redis.exceptions import RedisError
 
+from leoai.chat_response_cache import ChatResponseCache
 from leoai.ai_knowledge_models import KnowledgeSourceType
 from leoai.rag_knowledge_manager import (
     KnowledgeCreator, KnowledgeFetchError, KnowledgeInputError, KnowledgeUpdateResult,
@@ -15,6 +17,7 @@ from main_config import require_data_enrichment_key
 logger = logging.getLogger(__name__)
 router = APIRouter()
 creator = KnowledgeCreator()
+chat_response_cache = ChatResponseCache()
 
 
 @router.post("/_leoai/update-knowledge", response_model=KnowledgeUpdateResult)
@@ -29,7 +32,7 @@ async def update_knowledge(
     _: None = Depends(require_data_enrichment_key),
 ):
     try:
-        return await creator.upsert_url(
+        result = await creator.upsert_url(
             str(url), visitor_id=visitor_id, source_type=source_type, name=name
         )
     except KnowledgeInputError as exc:
@@ -41,3 +44,8 @@ async def update_knowledge(
     except Exception as exc:
         logger.exception("Knowledge ingestion failed for visitor %s", visitor_id)
         raise HTTPException(status_code=500, detail="Knowledge ingestion failed; no update was committed.") from exc
+    try:
+        await chat_response_cache.invalidate_visitor(visitor_id)
+    except RedisError:
+        logger.exception("Chat cache invalidation failed after knowledge was committed.")
+    return result

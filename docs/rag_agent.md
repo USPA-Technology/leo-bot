@@ -5,12 +5,15 @@
 # Overview
 
 [`leoai/rag_agent.py`](../leoai/rag_agent.py) coordinates the retrieval-augmented
-chat flow used by LeoBot. Parsing, response-formatting, and enrichment submission helpers live in
-[`leoai/rag_agent_utils.py`](../leoai/rag_agent_utils.py), keeping the agent
-module focused on workflow orchestration. Together, the modules support three
-user-facing paths:
+chat flow used by LeoBot. Intent detection lives in
+[`leoai/ai_intent_detection.py`](../leoai/ai_intent_detection.py); parsing,
+response-formatting, and enrichment submission helpers live in
+[`leoai/rag_agent_utils.py`](../leoai/rag_agent_utils.py). Together, the
+modules support three user-facing paths:
 
-1. **Document chat** retrieves knowledge without mixing it with geolocation state.
+1. **Document chat** is selected by `IntentDetector` from the message and
+   request context, then retrieves knowledge without mixing it with geolocation
+   state.
 2. **Nearby-place search** parses a category and metric radius, searches local
    data by coordinates, and queues background enrichment when there are no
    matches or fewer than requested. Existing matches remain in a partial
@@ -18,6 +21,13 @@ user-facing paths:
    HTML when called directly.
 3. **Standard chat** persists the message, builds context, optionally handles a
    place choice, builds a prompt, generates an answer, and persists the answer.
+
+`IntentDetector` uses the provider-neutral `AIClient` with a constrained JSON
+schema. It receives the user question and `RequestContext`, predicts one
+`primary_intent`, a generation `purpose`, optional secondary intents, calibrated
+confidence, and entities. Invalid or unavailable model output is converted to a logged,
+low-confidence `general_chat` result that requires clarification rather than
+being routed to a specialized handler.
 
 # Answer instruction contracts
 
@@ -47,8 +57,8 @@ evidence that a model will always comply.
 
 This module has no agent state or direct database writes. It provides:
 
-- classifying document and greeting messages locally, and using the configured
-  `AIClient` to classify nearby-place intent and extract search categories;
+- detecting greetings and using the configured `AIClient` to classify
+  nearby-place intent and extract search categories;
 - parsing place selections and requested result limits; and
 - formatting nearby-place results, pickers, and confirmations as user-facing
   text or HTML; and
@@ -74,18 +84,13 @@ orchestrator. It coordinates the database, context manager, knowledge
 retriever, prompt builder, Redis profile cache, and generation client.
 
 `ChatMessageState` carries identifiers, message and touchpoint metadata,
-location, retrieved context, place-selection state, prompt routing data, and
-the final response.
+`primary_intent`, location, retrieved context, place-selection state, prompt
+routing data, and the final response.
 
 # Public helpers
 
 The following helpers are implemented in `rag_agent_utils.py` and re-exported
 by `rag_agent.py` for backwards compatibility.
-
-## `is_document_chat(context, persona_id)`
-
-Returns `True` for the document-chat combination of the `agent` context and
-`personal_assistant` persona.
 
 ## `is_greeting_message(message)`
 
@@ -112,7 +117,8 @@ AI request. Nearby phrases are matched after Vietnamese accent normalization.
 
 Resolves the requested number of results. An explicit API value wins over a
 number parsed from the message. If no number is supplied,
-`NEARBY_PLACES_LIMIT` is used. Invalid, non-positive, and boolean values raise
+an AI-extracted count is considered before `NEARBY_PLACES_LIMIT`.
+Invalid, non-positive, and boolean values raise
 `ValueError`.
 
 ## `nearby_radius_meters(message)`
@@ -120,6 +126,80 @@ number parsed from the message. If no number is supplied,
 Parses a positive metric radius such as `1 km`, `500 meters`, or `1,5 km`.
 If no radius is present, `NEARBY_PLACES_RADIUS_METERS` is used. The same radius
 is applied to the local PostGIS query and the enrichment job.
+
+## Hybrid nearby-place lookup and discovery notifications
+
+The lookup uses PostGIS to enforce the requested radius and tenant visibility.
+It matches PostgreSQL full-text tokens in **place names only**. Descriptions,
+categories, and tags cannot promote a place into the name-match result list.
+For example, `miến` matches `miến ngon`, `Miến trộn Đậu Đậu`, and
+`Miến xào Phúc Cua`; a phở shop mentioning miến in metadata is not a name match.
+If the lexical results satisfy the requested count, no embedding API is called.
+
+When the list is still short and nearby place-owned knowledge vectors exist,
+the lookup embeds the narrow category terms and returns recommendations in a
+separate `similar_places` JSON array, **never mixed into `places` or `answer`**.
+The API also returns a localized `similar_places_notice` and separately escaped
+`similar_places_answer`; the browser displays them as a second labelled message.
+Similar suggestions do not count toward the requested matches or prevent
+background discovery from running. It deduplicates places with multiple chunks, excludes lexical
+matches already returned, and accepts cosine distance at most `0.35`. This
+initial relevance threshold is conservative but requires production calibration
+for the configured embedding model. Vector generation has a five-second wait
+budget; timeouts or provider failures are logged, and cached lexical matches
+remain available while discovery can fill the gaps.
+
+`/_leoai/ask` still returns partial results and the existing enrichment SSE URL
+immediately after Dagster accepts the job. `process_places` now publishes
+`PLACES_READY` to Redis **after its PostgreSQL transaction commits**. The SSE
+route subscribes to the run-specific channel and replays retained state, so
+events published before the browser connects are not lost. Redis readiness can
+interrupt a slow Dagster status poll. The browser refreshes its latest question
+once on readiness and closes that stream, without waiting for descriptions,
+web sources, mass schedules, or embeddings. `SUCCESS` remains a backward-
+compatible fallback when Redis is unavailable.
+
+Freshly saved places can be returned by the lexical query before their vectors
+exist. Discovery completion does not promise a full result count: only real
+matching places within the user's radius are returned.
+
+For existing databases, apply
+[`geo_places_search_indexes.sql`](../sql_scripts/geo_places_search_indexes.sql)
+outside a transaction. It builds the name-only full-text and place-source lookup indexes
+concurrently without blocking normal writes. New installations include the
+same indexes in the base schema.
+
+## Five-minute request cache for `/ask` and `/_leoai/ask`
+
+Both aliases share a Redis response cache with a **300-second TTL**.
+Validation and rate limiting still run on every request. An identical cached
+request returns the complete original JSON before intent detection, search,
+generation, history writes, or another Dagster submission.
+
+Cache fingerprints include the normalized visitor ID, full validated payload,
+effective touchpoint, and current profile ID. Changes to the question, context,
+persona, coordinates, count, language, or output format cause a miss. Each
+visitor retains only their latest request, avoiding reuse of an old answer after
+an intervening question. The explicit document-agent mode remains isolated from
+the visitor's cached geolocation.
+
+Discovery increments the cache's place-data revision in the same Redis
+transaction that stores and publishes `PLACES_READY`, **after PostgreSQL has
+committed**. The SSE-triggered repeat therefore fetches new results rather than
+the cached partial answer. Terminal Dagster status fallback also invalidates
+the place revision. Knowledge ingestion, geolocation updates, and visitor
+context updates invalidate that visitor's cache.
+
+Redis Lua operations compare both data revisions and the latest request token
+before storing a response. A slow request cannot repopulate stale data after
+invalidation or replace the answer for a newer request. Only successful
+responses are cached; agent failures now carry an explicit error flag and are
+not cached. Cache failures are logged and the fresh-request flow continues.
+
+The cache preserves `places`, `similar_places`, their separate UI labels,
+and enrichment SSE URLs without changing the response on a cache hit.
+This caches completed responses; simultaneous requests that arrive before the
+first response is stored can still be processed independently.
 
 ## `geo_places_search_name(message)`
 
@@ -176,11 +256,14 @@ The database manager owns the upsert behavior.
 
 Public asynchronous entry point for chat. It assembles a
 `ChatMessageState`, invokes the cached workflow, and returns the response.
-Document-chat and standard-chat routing happens inside the graph.
+Intent classification happens before the graph runs. The router and
+`RAGAgent` pass a `RequestContext` to `IntentDetector`, which returns an
+`IntentDetectionResult`. The graph uses `primary_intent` for its first
+conditional edge.
 
 The workflow is assembled with these stages:
 
-1. Route document chat or standard chat.
+1. Route `document_chat` or continue with the standard workflow.
 2. Validate coordinates and nearby-place parameters.
 3. Search nearby places, or prepare the standard touchpoint.
    An incomplete nearby result list routes to background enrichment before its
@@ -196,8 +279,8 @@ instance. Subsequent messages reuse the same graph.
 
 ## `_route_chat_type(state)`
 
-Routes document-chat requests to `_chat_document_node`; all other requests
-continue through input validation.
+Routes requests whose `primary_intent` is `document_chat` to
+`_chat_document_node`; all other requests continue through input validation.
 
 ## `_validate_input_node(state)`
 
@@ -271,7 +354,10 @@ confirmation.
 ## `_build_prompt_node(state)`
 
 Retrieves focused knowledge for a selected place, updates the profile cache
-when a first name is available, and builds the prompt router.
+when a first name is available, and passes the complete `IntentDetectionResult`
+to `AgentOrchestrator.build_prompt`. The prompt router retains the same
+validated result and embeds it as application metadata for the generation
+model; it is not treated as user instructions.
 
 ## `_generate_answer_node(state)`
 
@@ -280,7 +366,8 @@ Generates the response through `_safe_generate`.
 ## `_save_answer_node(state)`
 
 Persists generated text responses. Report-style prompts are intentionally not
-persisted as ordinary chat messages.
+persisted as ordinary chat messages. Answer, plan, and code purposes are
+persisted because they are normal user-facing chat responses.
 
 ## `_retrieve_selected_place_knowledge(selected_place, user_message)`
 
@@ -325,8 +412,9 @@ process_places
 
 Discovery calls Brave Place Search, filters unrelated results, and uses PostGIS
 `ST_DWithin` to enforce the radius. Brave's radius parameter alone is only a
-location bias. At most five matching places are upserted into `geo_places`
-using the requested category. `process_brave_search` and `process_knowledge`
+location bias. Discovery saves a bounded pool of matching candidates into
+`geo_places` using the requested category; downstream enrichment processes at
+most five scoped places. `process_brave_search` and `process_knowledge`
 use the same category/radius scope. `process_mass_schedule` executes as part of
 the full job but skips non-church categories. Knowledge enrichment creates the
 place-owned `knowledge_sources` row and vectorized `knowledge_chunks`.
@@ -343,7 +431,8 @@ Bot: I have no matching place data within your requested radius yet.
 
 The existing chat API returns this notice in its `answer` field, so no frontend
 response shape changes are required. A later question queries the database
-again and returns available matching places. A queued run is not a promise
+automatically after `PLACES_READY` and returns available matching places.
+A queued run is not a promise
 that the provider will find results or that enrichment will succeed.
 
 Dagster must be running with the updated `dags_pipelines` code location and

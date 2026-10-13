@@ -86,7 +86,7 @@ phải thắng assumption từ summary.
 | context cũ | refresh hoặc nêu giới hạn |
 | hai source conflict | nói rõ conflict |
 | selected place chưa có | không tự chọn candidate |
-| document mode | loại location state |
+| `document_chat` intent | loại location state |
 
 Consent/data retention là product policy cần xác định thêm; không nên giả định
 đã được enforce chỉ vì có `cdp_profile_id`.

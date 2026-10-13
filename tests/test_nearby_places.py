@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import threading
 from contextlib import asynccontextmanager
 from html.parser import HTMLParser
 from types import SimpleNamespace
@@ -214,6 +215,7 @@ def test_agent_queries_database_before_any_ai_work(count):
             user_id="visitor", latitude=10.747904, longitude=106.6467328,
             radius_meters=rag_db_manager.NEARBY_PLACES_RADIUS_METERS,
             tenant_id="default",
+            similar_places=[],
         )
         agent.context.build_context_summary.assert_not_awaited()
         agent.create_geolocation_touchpoint.assert_not_awaited()
@@ -227,6 +229,174 @@ def test_agent_queries_database_before_any_ai_work(count):
         assert all(link["target"] == "_blank" for link in parser.links)
         assert len(agent.db.save_chat_message.await_args_list) == 2
         assert all(call.kwargs["embed"] is False for call in agent.db.save_chat_message.await_args_list)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "api_result_limit,expected_limit",
+    [(None, 7), (2, 2)],
+)
+def test_structured_location_intent_routes_without_reclassifying_nearby(
+    monkeypatch, api_result_limit, expected_limit,
+):
+    async def scenario():
+        agent = make_agent()
+        agent.db.find_nearby_places.return_value = places(1)
+        monkeypatch.setattr(
+            rag_agent_module,
+            "classify_nearby_place_intent",
+            Mock(side_effect=AssertionError("must use detected intent entities")),
+        )
+        intent_result = rag_agent_module.IntentDetectionResult(
+            primary_intent=rag_agent_module.IntentType.LOCATION_CHAT,
+            purpose="generate_answer",
+            confidence=0.94,
+            entities={
+                "place_type": "coffee",
+                "search_terms": ["coffee"],
+                "search_name": "coffee",
+                "result_limit": 7,
+                "radius_meters": 1200,
+            },
+        )
+
+        await agent.process_chat_message_with_metadata(
+            "visitor",
+            "Find a coffee shop at my location",
+            touchpoint_id="tp",
+            latitude=10.747904,
+            longitude=106.6467328,
+            target_language="English",
+            result_limit=api_result_limit,
+            intent_result=intent_result,
+        )
+
+        agent.db.find_nearby_places.assert_awaited_once_with(
+            "tp",
+            ["coffee"],
+            expected_limit,
+            user_id="visitor",
+            latitude=10.747904,
+            longitude=106.6467328,
+            radius_meters=1200,
+            tenant_id="default",
+            similar_places=[],
+        )
+
+    asyncio.run(scenario())
+
+
+def test_uncertain_intent_returns_clarification_without_running_graph():
+    async def scenario():
+        agent = make_agent()
+        intent_result = rag_agent_module.IntentDetectionResult(
+            primary_intent=rag_agent_module.IntentType.GENERAL_CHAT,
+            purpose="generate_text",
+            confidence=0.2,
+            needs_clarification=True,
+        )
+
+        result = await agent.process_chat_message_with_metadata(
+            "visitor",
+            "Maybe do something",
+            target_language="English",
+            intent_result=intent_result,
+        )
+
+        assert result["response"] == (
+            "What would you like help with? Please clarify your request."
+        )
+        assert result["enrichment_run_id"] is None
+        agent.db.find_nearby_places.assert_not_awaited()
+        agent.context.build_context_summary.assert_not_awaited()
+        agent._safe_generate.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_rate_limited_web_request_does_not_call_intent_detector(
+    route_client, monkeypatch,
+):
+    from leobot_router import leobot_main_router as routes
+
+    client, _ = route_client
+    detector = AsyncMock()
+    monkeypatch.setattr(routes.intent_detector, "detect_async", detector)
+    monkeypatch.setattr(routes, "is_safe_to_answer", lambda visitor: False)
+
+    response = client.post("/_leoai/ask", json={
+        "visitor_id": "visitor",
+        "question": "Find a church near me",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["error_code"] == 429
+    detector.assert_not_awaited()
+
+
+def test_unimplemented_intent_uses_general_flow_with_result_preserved(
+    route_client, monkeypatch,
+):
+    from leobot_router import leobot_main_router as routes
+
+    client, agent = route_client
+    intent_result = rag_agent_module.IntentDetectionResult(
+        primary_intent=rag_agent_module.IntentType.WEB_SEARCH_CHAT,
+        purpose="generate_answer",
+        confidence=0.91,
+    )
+    detector = AsyncMock(return_value=intent_result)
+    process_chat = AsyncMock(return_value={
+        "response": "General chat fallback",
+        "enrichment_run_id": None,
+    })
+    monkeypatch.setattr(routes.intent_detector, "detect_async", detector)
+    monkeypatch.setattr(agent, "process_chat_message_with_metadata", process_chat)
+
+    response = client.post("/_leoai/ask", json={
+        "visitor_id": "visitor",
+        "question": "Find this on the web",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["answer"] == "General chat fallback"
+    assert process_chat.call_args.kwargs["intent_result"] is intent_result
+    agent.create_geolocation_touchpoint.assert_not_awaited()
+
+
+def test_channel_is_passed_to_detector_without_affecting_intent(monkeypatch):
+    async def scenario():
+        agent = make_agent()
+        detected_contexts = []
+        clarification = rag_agent_module.IntentDetectionResult(
+            primary_intent=rag_agent_module.IntentType.GENERAL_CHAT,
+            purpose="generate_text",
+            confidence=0.2,
+            needs_clarification=True,
+        )
+
+        class CapturingDetector:
+            async def detect_async(self, message, context):
+                detected_contexts.append(context)
+                return clarification
+
+        monkeypatch.setattr(
+            rag_agent_module,
+            "intent_detector",
+            CapturingDetector(),
+        )
+        response = await agent.process_chat_message(
+            "visitor",
+            "Please clarify",
+            target_language="English",
+            channel="facebook_messenger",
+        )
+
+        assert "clarify" in response
+        assert detected_contexts[0].channel == "facebook_messenger"
+        assert detected_contexts[0].visitor_id == "visitor"
+        agent.db.find_nearby_places.assert_not_awaited()
 
     asyncio.run(scenario())
 
@@ -386,6 +556,11 @@ def route_client(monkeypatch):
         hset=Mock(),
     ))
     monkeypatch.setattr(routes, "is_safe_to_answer", lambda visitor: True)
+
+    async def wait_for_discovery(run_id):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(routes, "wait_for_geo_places_ready", wait_for_discovery)
     app = FastAPI()
     app.include_router(routes.router)
     return TestClient(app), agent
@@ -426,6 +601,7 @@ def test_geolocation_endpoint_returns_recommended_action_array(route_client):
     routes.REDIS_CLIENT.hset.assert_called_once_with(
         "visitor", mapping={"touchpoint_id": "new-tp"},
     )
+    routes.chat_response_cache.invalidate_visitor.assert_awaited_once_with("visitor")
 
 
 def test_geolocation_endpoint_returns_default_actions_when_no_categories(route_client):
@@ -490,14 +666,80 @@ def test_handle_chat_accepts_coordinates_and_api_count_override(route_client):
     agent.create_geolocation_touchpoint.assert_not_awaited()
 
 
+def test_mien_name_matches_and_similar_suggestions_have_independent_api_keys(
+    route_client, monkeypatch,
+):
+    from leobot_router import leobot_main_router as routes
+
+    client, agent = route_client
+    suggestions = places(5)
+    for row, name in zip(suggestions, [
+        "Bún Bò Ruốc", "Quán Bún Bò Cao", "Quán Phở Tân Hiệp",
+        "Bún bò O Hè", "Cơm Tấm Cali",
+    ]):
+        row["name"] = name
+
+    async def find_places(*args, similar_places, **kwargs):
+        similar_places.extend(suggestions)
+        return []
+
+    agent.db.find_nearby_places.side_effect = find_places
+    agent.db.resolve_nearby_location = AsyncMock(return_value=(10.79, 106.67))
+    monkeypatch.setattr(
+        routes.intent_detector, "detect_async",
+        AsyncMock(return_value=rag_agent_module.IntentDetectionResult(
+            primary_intent=rag_agent_module.IntentType.LOCATION_CHAT,
+            purpose="generate_answer", confidence=0.95,
+            entities={
+                "search_name": "miến", "search_terms": ["miến"],
+                "result_limit": 5,
+            },
+        )),
+    )
+    trigger = Mock(return_value="run-id")
+    monkeypatch.setattr(rag_agent_module, "trigger_geo_places_enrichment", trigger)
+    response = client.post("/_leoai/ask", json={
+        "visitor_id": "visitor", "question": "5 quán miến ngon",
+        "latitude": 10.79, "longitude": 106.67,
+        "answer_in_language": "Vietnamese", "answer_in_format": "html",
+    })
+    assert response.status_code == 200
+    data = response.json()
+    assert data["places"] == []
+    assert data["similar_places"] == suggestions
+    assert "không phải kết quả khớp tên" in data["similar_places_notice"]
+    assert data["similar_places_answer"].count("<li>") == 5
+    assert all(row["name"] not in data["answer"] for row in suggestions)
+    assert data["enrichment_run_id"] == "run-id"
+    assert trigger.call_args.kwargs["name"] == "miến"
+    assert trigger.call_args.kwargs["count"] == 5
+
+
 def test_handle_chat_returns_queued_enrichment_notice_for_no_data(route_client, monkeypatch):
     from leoai import rag_agent
+    from leobot_router import leobot_main_router as routes
 
     client, agent = route_client
     agent.db.find_nearby_places.return_value = []
     agent.db.resolve_nearby_location = AsyncMock(return_value=(10.75, 106.62))
     trigger = Mock(return_value="run-id")
     monkeypatch.setattr(rag_agent, "trigger_geo_places_enrichment", trigger)
+    monkeypatch.setattr(
+        routes.intent_detector,
+        "detect_async",
+        AsyncMock(return_value=rag_agent_module.IntentDetectionResult(
+            primary_intent=rag_agent_module.IntentType.LOCATION_CHAT,
+            purpose="generate_answer",
+            confidence=0.94,
+            entities={
+                "place_type": "coffee",
+                "search_terms": ["coffee"],
+                "search_name": "coffee",
+                "result_limit": 3,
+                "radius_meters": 1000,
+            },
+        )),
+    )
     response = client.post("/_leoai/ask", json={
         "visitor_id": "visitor", "question": "top 3 coffee shop near me in 1 km",
         "answer_in_language": "en",
@@ -516,6 +758,65 @@ def test_handle_chat_returns_queued_enrichment_notice_for_no_data(route_client, 
         name="coffee", latitude=10.75, longitude=106.62, radius=1000,
         count=3,
     )
+
+
+def test_fastapi_partial_pho_request_refreshes_on_discovery_ready(
+    route_client, monkeypatch,
+):
+    from leobot_router import leobot_main_router as routes
+
+    client, agent = route_client
+    saved_places = places(4)
+    for index, saved in enumerate(saved_places, 1):
+        saved["name"] = f"Pho shop {index}"
+    agent.db.find_nearby_places.side_effect = [saved_places[:1], saved_places]
+    agent.db.resolve_nearby_location = AsyncMock(return_value=(10.7905024, 106.676224))
+    detector = AsyncMock(return_value=rag_agent_module.IntentDetectionResult(
+        primary_intent=rag_agent_module.IntentType.LOCATION_CHAT,
+        purpose="generate_answer",
+        confidence=0.95,
+        entities={
+            "search_name": "pho", "search_terms": ["pho"],
+            "result_limit": 3, "radius_meters": 1000,
+        },
+    ))
+    monkeypatch.setattr(routes.intent_detector, "detect_async", detector)
+    trigger = Mock(return_value="run-id")
+    monkeypatch.setattr(rag_agent_module, "trigger_geo_places_enrichment", trigger)
+    monkeypatch.setattr(
+        routes, "wait_for_geo_places_ready",
+        AsyncMock(return_value={
+            "run_id": "run-id", "status": "PLACES_READY", "saved_places": 4,
+        }),
+    )
+    monkeypatch.setattr(
+        routes, "get_geo_places_enrichment_status", lambda run_id: "STARTED",
+    )
+    payload = {
+        "question": "4 quán phở gần tui trong 5 km",
+        "visitor_id": "visitor", "touchpoint_id": "tp",
+        "latitude": 10.7905024, "longitude": 106.676224,
+        "answer_in_language": "Vietnamese", "answer_in_format": "html",
+    }
+    initial = client.post("/_leoai/ask", json=payload)
+    assert initial.status_code == 200
+    assert initial.json()["answer"].count("<li>") == 1
+    assert initial.json()["enrichment_run_id"] == "run-id"
+    trigger.assert_called_once_with(
+        name="pho", latitude=10.7905024, longitude=106.676224,
+        radius=5000, count=3,
+    )
+    readiness = client.get(initial.json()["enrichment_status_url"])
+    assert '"status":"PLACES_READY"' in readiness.text
+    assert '"status":"SUCCESS"' not in readiness.text
+
+    refreshed = client.post("/_leoai/ask", json=payload)
+    assert refreshed.status_code == 200
+    assert refreshed.json()["answer"].count("<li>") == 4
+    assert "enrichment_run_id" not in refreshed.json()
+    assert trigger.call_count == 1
+    assert agent.db.find_nearby_places.call_args.args[2] == 4
+    assert agent.db.find_nearby_places.call_args.kwargs["radius_meters"] == 5000
 
 
 def test_geo_places_enrichment_sse_streams_until_terminal_status(
@@ -540,6 +841,86 @@ def test_geo_places_enrichment_sse_streams_until_terminal_status(
     assert "data: {\"run_id\":\"run-id\",\"status\":\"QUEUED\"}" in body
     assert "data: {\"run_id\":\"run-id\",\"status\":\"STARTED\"}" in body
     assert "data: {\"run_id\":\"run-id\",\"status\":\"SUCCESS\"}" in body
+
+
+def test_sse_returns_committed_discovery_before_job_finishes(route_client, monkeypatch):
+    from leobot_router import leobot_main_router as routes
+
+    client, _ = route_client
+    monkeypatch.setattr(
+        routes,
+        "wait_for_geo_places_ready",
+        AsyncMock(return_value={
+            "run_id": "run-id", "status": "PLACES_READY", "saved_places": 4,
+        }),
+    )
+    monkeypatch.setattr(
+        routes, "get_geo_places_enrichment_status", lambda run_id: "STARTED",
+    )
+    with client.stream(
+        "GET", "/_leoai/geo-places/enrichment/run-id/events"
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert '"status":"PLACES_READY"' in body
+    assert '"saved_places":4' in body
+    assert '"status":"SUCCESS"' not in body
+
+
+def test_sse_redis_failure_falls_back_to_dagster(route_client, monkeypatch, caplog):
+    from redis.exceptions import ConnectionError
+    from leobot_router import leobot_main_router as routes
+
+    client, _ = route_client
+    monkeypatch.setattr(
+        routes,
+        "wait_for_geo_places_ready",
+        AsyncMock(side_effect=ConnectionError("Redis offline")),
+    )
+    monkeypatch.setattr(
+        routes, "get_geo_places_enrichment_status", lambda run_id: "SUCCESS",
+    )
+    with client.stream(
+        "GET", "/_leoai/geo-places/enrichment/run-id/events"
+    ) as response:
+        body = "".join(response.iter_text())
+    assert '"status":"SUCCESS"' in body
+    assert "falling back to Dagster status" in caplog.text
+
+
+def test_redis_readiness_does_not_wait_for_slow_dagster_status(monkeypatch):
+    from leobot_router import leobot_main_router as routes
+
+    poll_started = threading.Event()
+    poll_release = threading.Event()
+    poll_finished = []
+
+    def poll(run_id):
+        poll_started.set()
+        poll_release.wait(timeout=2)
+        poll_finished.append(True)
+        return "STARTED"
+
+    async def ready(run_id):
+        await asyncio.to_thread(poll_started.wait, 2)
+        return {"run_id": run_id, "status": "PLACES_READY", "saved_places": 4}
+
+    monkeypatch.setattr(routes, "get_geo_places_enrichment_status", poll)
+    monkeypatch.setattr(routes, "wait_for_geo_places_ready", ready)
+
+    async def scenario():
+        response = await routes.geo_places_enrichment_events("run-id")
+        try:
+            body = "".join([
+                chunk async for chunk in response.body_iterator
+            ])
+            assert '"status":"PLACES_READY"' in body
+            assert poll_finished == []
+        finally:
+            poll_release.set()
+
+    asyncio.run(scenario())
 
 
 def test_unaccented_noodle_question_queues_dagster_enrichment(route_client, monkeypatch):
@@ -568,18 +949,36 @@ def test_unaccented_noodle_question_queues_dagster_enrichment(route_client, monk
         longitude=None,
         radius_meters=rag_db_manager.NEARBY_PLACES_RADIUS_METERS,
         tenant_id="default",
+        similar_places=[],
     )
     trigger.assert_called_once_with(
         name="noodle",
         latitude=10.75,
         longitude=106.62,
         radius=rag_db_manager.NEARBY_PLACES_RADIUS_METERS,
-        count=5,
+        count=rag_agent_module.MAX_GEO_PLACES_ENRICHMENT,
     )
 
 
-def test_handle_chat_rejects_invalid_radius_before_search(route_client):
+def test_handle_chat_rejects_invalid_radius_before_search(route_client, monkeypatch):
+    from leobot_router import leobot_main_router as routes
+
     client, agent = route_client
+    monkeypatch.setattr(
+        routes.intent_detector,
+        "detect_async",
+        AsyncMock(return_value=rag_agent_module.IntentDetectionResult(
+            primary_intent=rag_agent_module.IntentType.LOCATION_CHAT,
+            purpose="generate_answer",
+            confidence=0.94,
+            entities={
+                "place_type": "coffee",
+                "search_terms": ["coffee"],
+                "search_name": "coffee",
+                "radius_meters": -1000,
+            },
+        )),
+    )
     response = client.post("/_leoai/ask", json={
         "visitor_id": "visitor", "question": "coffee near me in -1 km",
     })
@@ -617,15 +1016,18 @@ def test_real_postgis_filters_orders_and_returns_requested_counts(monkeypatch):
             await conn.execute(f'SET LOCAL search_path TO "{schema}", public')
             await conn.execute("""
                 CREATE TABLE touchpoints (
-                    touchpoint_id text, user_id text, latitude numeric, longitude numeric
+                    touchpoint_id text, user_id text, latitude numeric, longitude numeric,
+                    tenant_id text DEFAULT 'default'
                 );
                 CREATE TABLE geo_places (
                     id uuid PRIMARY KEY DEFAULT uuidv7(), name text, address text, description text,
-                    category text, tags text[], geom geometry(Point, 4326)
+                    category text, tags text[], geom geometry(Point, 4326),
+                    tenant_id text DEFAULT 'global'
                 );
             """)
             await conn.execute(
-                "INSERT INTO touchpoints VALUES ('tp', 'visitor', 10.747904, 106.6467328)"
+                "INSERT INTO touchpoints (touchpoint_id,user_id,latitude,longitude) "
+                "VALUES ('tp', 'visitor', 10.747904, 106.6467328)"
             )
             for index in range(25):
                 await conn.execute(
@@ -657,7 +1059,7 @@ def test_real_postgis_filters_orders_and_returns_requested_counts(monkeypatch):
                 None, ["Catholic"], 20, user_id="visitor",
                 latitude=10.747904, longitude=106.6467328,
             )
-            assert len(rows) == 20
+            assert rows == []
             with pytest.raises(NearbyLocationUnavailable):
                 await db.find_nearby_places("tp", ["church"], 3, user_id="other")
         finally:
@@ -665,3 +1067,20 @@ def test_real_postgis_filters_orders_and_returns_requested_counts(monkeypatch):
             await conn.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "question,expected_count,expected_meters",
+    [
+        ("4 quán phở gần tui trong 5 km", 4, 5_000),
+        ("5 quán phở trong 10 km", 5, 10_000),
+        ("Find cafes within 1.5 km", 3, 1_500),
+    ],
+)
+def test_count_and_radius_come_from_request_text_not_ai_defaults(
+    question, expected_count, expected_meters,
+):
+    from leoai.rag_agent_utils import nearby_radius_meters
+
+    assert nearby_result_limit(question, intent_limit=3) == expected_count
+    assert nearby_radius_meters(question, 1_000) == expected_meters

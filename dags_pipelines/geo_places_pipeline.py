@@ -30,6 +30,7 @@ from dagster import (
 from google.genai.errors import ClientError as GenAIClientError
 from psycopg2.extras import Json, RealDictCursor, execute_values
 from pydantic import Field
+from redis.exceptions import RedisError
 
 from dags_pipelines.agent_search_client import BraveAgentSearch, BravePlaceSearchClient
 from dags_pipelines.geo_places_sql_code import (
@@ -69,6 +70,7 @@ from leoai.ai_knowledge_models import (
     tokenized_chunk_text,
 )
 from leoai.db_utils import to_pgvector
+from leoai.geo_place_events import publish_geo_places_ready
 from leoai.rag_knowledge_manager import (
     KnowledgeFetchError,
     KnowledgeInputError,
@@ -240,6 +242,7 @@ class DiscoveryConfig(Config):
     longitude: float
     radius: float
     count: int = 20
+    candidate_count: int | None = Field(default=None, ge=1, le=50, strict=True)
 
 
 class PlaceRunScopeConfig(Config):
@@ -432,7 +435,7 @@ def process_places(
         latitude=config.latitude,
         longitude=config.longitude,
         radius=config.radius,
-        count=config.count,
+        count=config.candidate_count or config.count,
     )
     with pg.connect() as connection, connection.cursor() as cursor:
         category = (
@@ -442,6 +445,13 @@ def process_places(
         )
         GeoPlaceRepository().upsert(cursor, places, category=category)
     context.log.info("Brave returned %d unique valid places", len(places))
+    try:
+        publish_geo_places_ready(context.run.run_id, len(places))
+    except RedisError:
+        context.log.exception(
+            "Places are committed, but the Redis discovery notification failed; "
+            "clients can still observe the Dagster run status."
+        )
     return MaterializeResult(
         metadata={"upserted": len(places), "skipped_invalid": skipped}
     )

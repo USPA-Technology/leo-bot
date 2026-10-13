@@ -11,6 +11,7 @@ from dagster import validate_run_config
 from dags_pipelines import defs
 from dags_pipelines import geo_places_pipeline as pipeline
 from dags_pipelines import geo_places_sql_code
+from leoai.ai_intent_detection import IntentDetectionResult, IntentType
 from leoai import rag_agent, rag_agent_utils, rag_db_manager
 from leoai.rag_db_manager import ChatDBManager, NearbyLocationUnavailable
 
@@ -66,15 +67,24 @@ def intent_client(*, is_nearby, terms, search_name):
     }))
 
 
-@pytest.mark.parametrize("question,radius", [
-    ("top 3 coffee shop near me in 1 km", 1000),
-    ("cafes nearby within 500 meters", 500),
-    ("quán cà phê gần tôi trong 1,5 km", 1500),
-    ("churches near me in 0.5 kilometres", 500),
-    ("places nearby", rag_db_manager.NEARBY_PLACES_RADIUS_METERS),
-])
-def test_requested_radius(question, radius):
-    assert rag_agent_utils.nearby_radius_meters(question) == radius
+def location_intent_result(
+    search_name, terms, *, result_limit=None, radius_meters=None,
+):
+    entities = {
+        "place_type": search_name,
+        "search_terms": terms,
+        "search_name": search_name,
+    }
+    if result_limit is not None:
+        entities["result_limit"] = result_limit
+    if radius_meters is not None:
+        entities["radius_meters"] = radius_meters
+    return IntentDetectionResult(
+        primary_intent=IntentType.LOCATION_CHAT,
+        purpose="generate_answer",
+        confidence=0.95,
+        entities=entities,
+    )
 
 
 def test_unaccented_nearby_noodle_question_is_recognized_and_counted():
@@ -94,11 +104,14 @@ def test_unaccented_nearby_noodle_question_is_recognized_and_counted():
 
 
 @pytest.mark.parametrize("question", [
-    "coffee near me in 0 km", "places nearby in -1 km",
+    "restaurants near Ben Thanh Market",
+    "cafes close to my hotel",
+    "restaurants around District 1",
+    "quán ăn gần chợ Bến Thành",
+    "quán cà phê quanh khách sạn Rex",
 ])
-def test_invalid_radius(question):
-    with pytest.raises(ValueError, match="radius"):
-        rag_agent_utils.nearby_radius_meters(question)
+def test_named_nearby_locations_are_detected(question):
+    assert rag_agent_utils.has_nearby_location_phrase(question)
 
 
 def test_coffee_intent_does_not_match_unrelated_restaurants():
@@ -278,8 +291,14 @@ def test_pipeline_run_config_caps_places_and_rejects_invalid_inputs():
     config = rag_agent_utils.build_geo_places_pipeline_run_config(
         "ramen", 10.75, 106.62, 1000, count=20,
     )
-    assert config["ops"]["process_places"]["config"]["count"] == 5
-    assert config["ops"]["process_brave_search"]["config"]["max_places"] == 5
+    assert (
+        config["ops"]["process_places"]["config"]["count"]
+        == rag_agent_utils.MAX_GEO_PLACES_ENRICHMENT
+    )
+    assert (
+        config["ops"]["process_brave_search"]["config"]["max_places"]
+        == rag_agent_utils.MAX_GEO_PLACES_ENRICHMENT
+    )
     for invalid in (
         {"count": 0},
         {"count": True},
@@ -300,6 +319,8 @@ def test_pipeline_run_config_caps_places_and_rejects_invalid_inputs():
 
 
 def test_full_pipeline_inserts_and_enriches_ramen_places(monkeypatch):
+    publication = Mock()
+    monkeypatch.setattr(pipeline, "publish_geo_places_ready", publication)
     place_id = uuid4()
     geo_place = {
         "id": place_id,
@@ -393,6 +414,7 @@ def test_full_pipeline_inserts_and_enriches_ramen_places(monkeypatch):
     )
 
     assert result.success
+    publication.assert_called_once_with(result.run_id, 1)
     assert set(result.job_def.graph.node_names()) == {
         "process_places",
         "process_brave_search",
@@ -444,7 +466,8 @@ def test_trigger_submits_bounded_job_without_polling(monkeypatch):
         "latitude": 10.75,
         "longitude": 106.62,
         "radius": 1000,
-        "count": 5,
+        "count": rag_agent_utils.MAX_GEO_PLACES_ENRICHMENT,
+        "candidate_count": 15,
     }
     assert config["ops"]["process_brave_search"]["config"]["search_name"] == "coffee"
     assert config["ops"]["process_mass_schedule"]["config"]["search_name"] == "coffee"
@@ -534,10 +557,16 @@ def test_empty_search_queues_enrichment_and_returns_notice(
     monkeypatch.setattr(rag_agent, "trigger_geo_places_enrichment", trigger)
     agent = make_agent([])
 
-    response = asyncio.run(agent.process_chat_message(
+    result = asyncio.run(agent.process_chat_message_with_metadata(
         "visitor", question, target_language=language,
         touchpoint_id="tp", latitude=10.75, longitude=106.62,
+        intent_result=location_intent_result(
+            search_term,
+            ["coffee"] if search_term == "coffee" else ["ramen"],
+            radius_meters=1000 if "1 km" in question else None,
+        ),
     ))
+    response = result["response"]
 
     assert expected in response
     trigger.assert_called_once_with(
@@ -560,6 +589,7 @@ def test_empty_search_queues_enrichment_and_returns_notice(
             else rag_db_manager.NEARBY_PLACES_RADIUS_METERS
         ),
         tenant_id="default",
+        similar_places=[],
     )
     agent._safe_generate.assert_not_awaited()
     assert agent.db.save_chat_message.await_args_list[1].args[2] == response
@@ -580,7 +610,10 @@ def test_existing_results_do_not_trigger_enrichment(monkeypatch):
 
 @pytest.mark.parametrize(
     ("requested_count", "expected_enrichment_count"),
-    [(5, 4), (20, 5)],
+    [
+        (5, min(4, rag_agent_utils.MAX_GEO_PLACES_ENRICHMENT)),
+        (20, min(19, rag_agent_utils.MAX_GEO_PLACES_ENRICHMENT)),
+    ],
 )
 def test_partial_results_queue_only_the_missing_places_and_keep_existing_results(
     monkeypatch, requested_count, expected_enrichment_count,
@@ -623,10 +656,14 @@ def test_enrichment_resolves_cached_touchpoint_when_coordinates_are_not_in_reque
     trigger = Mock(return_value="run-id")
     monkeypatch.setattr(rag_agent, "trigger_geo_places_enrichment", trigger)
     agent = make_agent([])
-    response = asyncio.run(agent.process_chat_message(
+    result = asyncio.run(agent.process_chat_message_with_metadata(
         "visitor", "coffee near me in 1 km", touchpoint_id="cached-tp",
         target_language="English",
+        intent_result=location_intent_result(
+            "coffee", ["coffee"], radius_meters=1000,
+        ),
     ))
+    response = result["response"]
     assert "queued" in response
     agent.db.resolve_nearby_location.assert_awaited_once_with(
         "cached-tp", user_id="visitor", latitude=None, longitude=None,
@@ -634,7 +671,10 @@ def test_enrichment_resolves_cached_touchpoint_when_coordinates_are_not_in_reque
     )
     trigger.assert_called_once_with(
         name="coffee", latitude=10.75, longitude=106.62, radius=1000,
-        count=5,
+        count=min(
+            rag_db_manager.NEARBY_PLACES_LIMIT,
+            rag_agent_utils.MAX_GEO_PLACES_ENRICHMENT,
+        ),
     )
 
 

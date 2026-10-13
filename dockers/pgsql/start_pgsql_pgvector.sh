@@ -22,6 +22,14 @@ HOST_PORT="${PGSQL_DB_PORT:-5433}"
 
 # --- Canonical SQL schema ---
 SQL_FILE_PATH="$PROJECT_ROOT/sql_scripts/leo360_schema.sql"
+SEARCH_INDEX_SQL_PATH="$PROJECT_ROOT/sql_scripts/geo_places_search_indexes.sql"
+
+for sql_file in "$SQL_FILE_PATH" "$SEARCH_INDEX_SQL_PATH"; do
+  if [[ ! -f "$sql_file" ]]; then
+    echo "❌ Required SQL file not found: $sql_file" >&2
+    exit 1
+  fi
+done
 
 # --- Parse options ---
 RESET_DB=false
@@ -179,18 +187,15 @@ wait_for_postgres_target() {
 }
 wait_for_postgres_target
 
-# --- Apply the canonical schema ---
-if [[ ! -f "$SQL_FILE_PATH" ]]; then
-  echo "❌ SQL schema file not found: $SQL_FILE_PATH" >&2
-  exit 1
-fi
-
-echo "🔧 Applying canonical schema from '$SQL_FILE_PATH'..."
-if ! docker exec -i -u postgres "$CONTAINER_NAME" \
-    psql -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$SQL_FILE_PATH"; then
-  echo "❌ Failed to apply the canonical schema." >&2
-  exit 1
-fi
+# Separate psql sessions keep concurrent index creation outside a transaction.
+for sql_file in "$SQL_FILE_PATH" "$SEARCH_INDEX_SQL_PATH"; do
+  echo "🔧 Applying SQL from '$sql_file'..."
+  if ! docker exec -i -u postgres "$CONTAINER_NAME" \
+      psql -X -v ON_ERROR_STOP=1 -d "$TARGET_DB" < "$sql_file"; then
+    echo "❌ Failed to apply SQL from '$sql_file'." >&2
+    exit 1
+  fi
+done
 
 # --- Verify all tables exist ---
 TABLES=("chat_messages" "chat_message_embeddings" "geo_places" "touchpoints" "weather_data" "system_users" "conversational_context" "knowledge_sources" "knowledge_chunks" "customer_profile" "transactional_context" "customer_metrics" "tenant_metrics_config")

@@ -344,6 +344,11 @@ div.leobot-answer .botui-message-content {
   color: var(--leobot-ink) !important;
 }
 
+div.botui-message.geo-enrichment-status .botui-message-content {
+  background: transparent !important;
+  padding: 0 !important;
+}
+
 div.leobot-question .botui-message-content,
 .botui-message-content.human {
   background: var(--leobot-primary);

@@ -152,6 +152,23 @@ test("continues sending normal questions", async () => {
   );
 });
 
+test("shows similar recommendations as a separate labelled answer", async () => {
+  const chat = setupChat();
+  chat.context.sendQuestionToLeoAI("ask", "5 quán miến ngon");
+  await Promise.resolve();
+  const answer = "<p>No matching miến names yet.</p>";
+  const recommendations = "<p>Similar suggestions, not name matches.</p><ol><li>Phở</li></ol>";
+  chat.requests[0].success({
+    error_code: 0,
+    answer,
+    places: [],
+    similar_places: [{ name: "Phở" }],
+    similar_places_answer: recommendations,
+  });
+  assert.deepEqual(chat.answers, [answer, recommendations]);
+  assert.equal(chat.answers[0].includes("Phở"), false);
+});
+
 test("blank input shows feedback and restores the question prompt", async () => {
   const chat = setupChat();
   chat.context.sendQuestionToLeoAI("ask", "   ");
@@ -198,7 +215,10 @@ test("refreshes the latest user question after enrichment succeeds", async () =>
   );
 
   source.onmessage({ data: JSON.stringify({ run_id: "run-id", status: "STARTED" }) });
-  assert.match(chat.statusMessages[0].content, /place search is running/i);
+  assert.match(chat.statusMessages[0].content, /Searching nearby places/);
+  assert.match(chat.statusMessages[0].content, /alert-primary/);
+  assert.match(chat.statusMessages[0].content, /spinner-border/);
+  assert.equal(chat.statusMessages[0].type, "html");
   assert.equal(source.closed, false);
 
   chat.context.sendQuestionToLeoAI("ask", "latest user question");
@@ -207,7 +227,9 @@ test("refreshes the latest user question after enrichment succeeds", async () =>
 
   source.onmessage({ data: JSON.stringify({ run_id: "run-id", status: "SUCCESS" }) });
   await Promise.resolve();
-  assert.match(chat.statusMessages[1].content, /checking updated results/i);
+  assert.match(chat.statusMessages[1].content, /checking your latest question/i);
+  assert.match(chat.statusMessages[1].content, /alert-success/);
+  assert.match(chat.statusMessages[1].content, /bi-check-circle-fill/);
   assert.equal(source.closed, true);
   assert.equal(chat.requests.length, 3);
   assert.equal(
@@ -226,4 +248,33 @@ test("refreshes the latest user question after enrichment succeeds", async () =>
   });
   assert.equal(secondSource.closed, true);
   assert.equal(chat.requests.length, 3);
+});
+
+test("refreshes once when discovery saves places before enrichment succeeds", async () => {
+  const chat = setupChat();
+  chat.context.sendQuestionToLeoAI("ask", "4 quán phở gần tui trong 5 km");
+  await Promise.resolve();
+  chat.requests[0].success({
+    error_code: 0,
+    answer: "Discovery queued",
+    enrichment_status_url: "/_leoai/geo-places/enrichment/run-id/events",
+  });
+  const source = chat.eventSources[0];
+  source.onmessage({
+    data: JSON.stringify({
+      run_id: "run-id", status: "PLACES_READY", saved_places: 4,
+    }),
+  });
+  await Promise.resolve();
+  assert.equal(source.closed, true);
+  assert.equal(chat.requests.length, 2);
+  assert.equal(
+    JSON.parse(chat.requests[1].options.data).question,
+    "4 quán phở gần tui trong 5 km"
+  );
+  source.onmessage({
+    data: JSON.stringify({ run_id: "run-id", status: "SUCCESS" }),
+  });
+  await Promise.resolve();
+  assert.equal(chat.requests.length, 2);
 });

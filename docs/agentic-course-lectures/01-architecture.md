@@ -109,10 +109,17 @@ agentic thay vì thổi phồng autonomy.
 # Agent loop trong LEO Bot
 
 ```text
-Observe: question + saved context
+Observe: question + channel/persona/context
     │
     ▼
-Decide: document / nearby / standard
+IntentDetector (AIClient + JSON schema)
+    │
+    ├─ low confidence / needs clarification → ask, do not route
+    ▼
+Validated IntentDetectionResult
+    │ primary_intent + purpose + entities + confidence
+    ▼
+Decide: document / location / general workflow
     │
     ▼
 Act: retrieve / query / persist / generate
@@ -124,6 +131,9 @@ Observe: evidence / response / run_id
 ```
 
 Graph kết thúc rõ ràng; enrichment được quan sát ở request sau.
+Channel chỉ mô tả transport (`web_widget`, `facebook_messenger`, `zalo_oa`);
+nó không quyết định intent. Visitor, tenant và touchpoint IDs được giữ ngoài
+prompt phân loại vì không cần thiết để xác định mục tiêu.
 
 ---
 
@@ -136,6 +146,7 @@ Graph kết thúc rõ ràng; enrichment được quan sát ở request sau.
 | LLM/GenAI provider | [`leoai/ai_core.py`](../../leoai/ai_core.py) |
 | Agent state | `ChatMessageState` trong [`leoai/rag_agent.py`](../../leoai/rag_agent.py) |
 | Orchestration/decision | `StateGraph`, conditional edges trong [`leoai/rag_agent.py`](../../leoai/rag_agent.py) |
+| Intent classification | `IntentDetector` / `IntentDetectionResult` trong [`leoai/ai_intent_detection.py`](../../leoai/ai_intent_detection.py) |
 | Memory/context | [`leoai/rag_context_manager.py`](../../leoai/rag_context_manager.py) |
 | RAG | [`leoai/rag_knowledge_manager.py`](../../leoai/rag_knowledge_manager.py) |
 | Tool/action boundary | [`leoai/rag_db_manager.py`](../../leoai/rag_db_manager.py), [`leoai/rag_agent_utils.py`](../../leoai/rag_agent_utils.py) |
@@ -195,9 +206,16 @@ HTTP client
     ▼
 FastAPI router: POST /ask
     │
+    ├─ request filter
+    ├─ IntentDetector (question + safe RequestContext)
+    │    ├─ low confidence → clarification, no RAG workflow
+    │    └─ validated IntentDetectionResult
     ▼
-RAGAgent.process_chat_message_with_metadata()
+RAGAgent.process_chat_message_with_metadata(result)
     │
+    ├─ same result in ChatMessageState
+    ├─ document / location / standard route
+    ├─ build_prompt receives full result and purpose
     ├─ LangGraph workflow
     ├─ ContextManager / KnowledgeRetriever
     ├─ ChatDBManager → PostgreSQL + pgvector/PostGIS
@@ -211,11 +229,25 @@ RAGAgent.process_chat_message_with_metadata()
 
 # Walkthrough: `/ask`
 
-1. Router validate `visitor_id` và câu hỏi.
-2. Xác định document chat hay nearby-place search.
-3. Áp dụng Redis rate limit và resolve `touchpoint_id`.
-4. `RAGAgent` chạy workflow, có thể trả `enrichment_run_id`.
-5. Router đóng gói JSON response.
+1. Router chuẩn hóa/validate `visitor_id` và câu hỏi.
+2. Áp dụng Redis rate limit trước khi gọi model để request bị chặn không tạo
+   model cost.
+3. `IntentDetector.detect_async()` gửi câu hỏi cùng context cần thiết
+   (`channel`, `context`, `persona_id`) tới `AIClient`, yêu cầu JSON có schema.
+   Visitor/tenant/touchpoint IDs không được đưa vào prompt phân loại.
+4. Validate `IntentDetectionResult`: intent, `purpose`, secondary intents,
+   model-estimated confidence, entities và `needs_clarification`. Result dưới
+   ngưỡng 0.55 luôn yêu cầu clarification; confidence này là estimate của model,
+   không phải probability đã được hiệu chuẩn bằng evaluation dataset.
+5. Nếu cần clarification, trả lời yêu cầu làm rõ và không chạy graph,
+   retrieval, geospatial query hoặc generation.
+6. Nếu được phép xử lý, router kiểm tra nearby parameters khi intent rõ ràng là
+   `location_chat` và resolve touchpoint.
+7. Router truyền nguyên result vào `RAGAgent`; không
+   phân loại lại intent.
+8. Graph route document/location/standard. `build_prompt` nhận toàn bộ
+   `IntentDetectionResult`; purpose được dùng trực tiếp thay vì heuristic thứ hai.
+9. Router đóng gói JSON response, có thể kèm `enrichment_run_id`.
 
 ```python
 @router.post("/ask", response_class=JSONResponse)
@@ -250,7 +282,7 @@ async def handle_chat(msg: Message):
 **Input:** `Tìm 3 quán cà phê gần tôi trong bán kính 1 km`
 
 - Đặt breakpoint/log tại `handle_chat`.
-- Quan sát `classify_nearby_place_intent`.
+- Quan sát `IntentDetector` và JSON `location_chat` entities.
 - Xem `find_nearby_places` dùng `ST_DWithin`.
 - Nếu thiếu kết quả, ghi nhận `enrichment_run_id`.
 - Mở test tương ứng trước khi sửa code.

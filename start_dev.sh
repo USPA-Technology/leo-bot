@@ -63,6 +63,7 @@ KEYCLOAK_HEALTHCHECK="${KEYCLOAK_URL}/realms/${KEYCLOAK_REALM}/.well-known/openi
 VENV_PATH="env/bin/activate"
 FASTAPI_APP="main_app:leobot"
 FASTAPI_PORT="${FASTAPI_PORT:-8888}"
+LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
 # ------------------------------------------------------------------------------
 # Function: wait for PostgreSQL
@@ -134,7 +135,12 @@ wait_for_keycloak() {
 # EXECUTION FLOW
 # ------------------------------------------------------------------------------
 
-# 1. Start Postgres (Always required)
+# Update before applying SQL so startup uses the updated schema and indexes.
+echo -e "${YELLOW}📦 Updating Git repository...${NC}"
+git pull --quiet
+echo -e "${GREEN}✅ Repository updated.${NC}"
+
+# 1. Start Postgres (applies canonical schema and geo-place search indexes)
 wait_for_postgres
 
 if [[ "$SEED_DATA" == true ]]; then
@@ -149,11 +155,6 @@ if [[ "$KEYCLOAK_ENABLED" == "true" ]]; then
 else
   echo -e "${BLUE}ℹ️  KEYCLOAK_ENABLED is '$KEYCLOAK_ENABLED'. Skipping Keycloak startup.${NC}"
 fi
-
-# 3. Update Git
-echo -e "${YELLOW}📦 Updating Git repository...${NC}"
-git pull --quiet
-echo -e "${GREEN}✅ Repository updated.${NC}"
 
 # 4. Activate Venv
 if [[ ! -x "env/bin/python" ]]; then
@@ -182,11 +183,13 @@ echo -e "${GREEN}✅ Using Python ${PYTHON_MINOR}.${NC}"
 
 # 5. Run FastAPI
 echo -e "${YELLOW}⚡ Launching FastAPI (port ${FASTAPI_PORT})...${NC}"
+echo -e "${BLUE}🪵 Application log level: ${LOG_LEVEL}${NC}"
 UVICORN_ARGS=(
   "$FASTAPI_APP"
   --reload
   --host 0.0.0.0
   --port "$FASTAPI_PORT"
+  --log-level "${LOG_LEVEL,,}"
 )
 if [[ -f .env ]]; then
   UVICORN_ARGS+=(--env-file .env)

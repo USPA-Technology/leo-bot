@@ -3,6 +3,10 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from leoai.rag_agent import RAGAgent
+from leobot_router.leobot_request_filter import (
+    RequestFilterUnavailable,
+    filter_webhook_message,
+)
 from main_config import ZALO_OA_ACCESS_TOKEN
 
 # Zalo webhook router
@@ -26,17 +30,25 @@ async def zalo_webhook_handler(request: Request):
             user_msg = body.get("message", {}).get("text")
             if not user_id or not user_msg:
                 return {"ok": True}
-            logger.info(f"Zalo user '{user_id}' said: {user_msg}")
+            filtered = filter_webhook_message(user_id, user_msg)
+            if filtered is None:
+                logger.warning("Rejected invalid or rate-limited Zalo message")
+                return {"ok": True}
+            logger.info("Zalo user '%s' sent an accepted message", filtered.visitor_id)
 
             ai_reply = await rag_agent.process_chat_message(
-                user_id=user_id,
-                user_message=user_msg,
+                user_id=filtered.visitor_id,
+                user_message=filtered.message,
                 persona_id="zalo_user",
                 cdp_profile_id="",
                 touchpoint_id="zalo",
+                channel="zalo_oa",
             )
             await send_message_to_zalo(user_id, ai_reply)
-    except Exception as e:
+    except RequestFilterUnavailable:
+        logger.exception("Zalo chat rate-limit store is unavailable")
+        return JSONResponse(status_code=503, content={"error": "Chat service unavailable"})
+    except Exception:
         logger.exception("Error in Zalo webhook handler")
         return JSONResponse(status_code=500, content={"error": "Webhook processing failed"})
 

@@ -20,6 +20,7 @@ footer: "LEO Bot • Buổi 2"
 
 - identity: `user_id`, `tenant_id`, `cdp_profile_id`
 - input: `user_message`, `context`, `persona_id`
+- intent: `primary_intent`, full `intent_result` (purpose, confidence, entities)
 - location: tọa độ, touchpoint, radius
 - retrieval: `terms`, `matching_places`, `summarized_context`
 - decision: `selected_place`, `prompt_router`
@@ -32,8 +33,13 @@ footer: "LEO Bot • Buổi 2"
 
 # Graph thực tế
 
+Intent được phát hiện **trước** khi LangGraph chạy. Nếu
+`needs_clarification=True`, RAG trả câu hỏi làm rõ và graph không chạy.
+
 ```text
-START
+IntentDetector (AIClient JSON)
+ ├─ needs clarification ─────────────────────────► clarification response
+ └─ accepted result → START
  ├─ document_chat ───────────────────────────────► END
  └─ validate_input
      ├─ nearby_places ─► enrich_geo_places ─► save_nearby_exchange ─► END
@@ -57,9 +63,25 @@ workflow.add_conditional_edges(
 )
 ```
 
-- `is_document_chat(context, persona_id)` tách document mode khỏi location state.
-- `nearby_places` chỉ chạy khi classifier xác định nearby intent.
+- `IntentDetector` trong `leoai/ai_intent_detection.py` phân loại
+  bằng `AIClient` và JSON schema, trả về `primary_intent`, `purpose`,
+  model-estimated confidence, entities và clarification state trước khi graph
+  chạy. Confidence dưới 0.55 bị đánh dấu cần clarification; đây chưa phải
+  probability được hiệu chuẩn bằng labeled evaluation set.
+  `RequestContext.channel` mô tả transport và không được dùng như intent.
+- Router truyền cùng một `IntentDetectionResult` qua RAG; không chạy lại intent
+  detector.
+- Web route rate-limits sau validation nhẹ và trước `IntentDetector`, ngăn
+  request bị throttle tiêu tốn model call.
+- `location_chat` dùng `search_terms`, `place_type` và `search_name` trong
+  `entities`; không chạy thêm nearby-intent classifier để lật lại quyết định
+  location. Với legacy caller thiếu entities, fallback chỉ trích xuất terms
+  nhưng vẫn giữ intent location. Nearby parser chỉ xử lý tham số radius/count.
 - `build_context` quyết định picker, selection hay generate answer.
+- `purpose` được truyền nguyên vẹn vào `build_prompt`, không chạy một bộ
+  keyword classifier thứ hai.
+- Câu hỏi phân loại chỉ nhận channel/context/persona cần thiết; visitor, tenant
+  và touchpoint IDs không gửi tới model intent.
 
 **Đừng suy luận route từ tên node; đọc hàm `_route_*` và test.**
 
@@ -76,6 +98,8 @@ workflow.add_conditional_edges(
 Test thêm:
 
 - nearby nhưng không có tọa độ;
+- intent confidence thấp: trả clarification và không truy cập retrieval/DB;
+- structured location entities phải được dùng nguyên trạng, không phân loại lại;
 - chọn `4` khi chỉ có 3 choices;
 - input có một tọa độ nhưng thiếu tọa độ còn lại.
 
@@ -141,7 +165,7 @@ START
 
 # Vì sao route này đúng?
 
-- `context` và `persona_id` tách document chat khỏi location state.
+- `primary_intent` tách document chat khỏi location state.
 - `is_nearby_search` chỉ dẫn tới geo query sau validation.
 - thiếu location trả lời yêu cầu chia sẻ vị trí, không giả làm empty result.
 - `matching_places` thiếu so với `result_limit` mới được queue enrichment.

@@ -129,7 +129,7 @@ Expected:
 
 - retrieval scope theo `tenant_id` + `user_id`;
 - source/URI xuất hiện trong context;
-- document chat không đọc nearby place state;
+- `document_chat` không đọc nearby place state;
 - empty retrieval không biến thành claim chắc chắn.
 
 ---
